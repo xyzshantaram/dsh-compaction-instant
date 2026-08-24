@@ -42,15 +42,11 @@ export interface InstantCompactionConfig {
     summarizationProvider?: string;
     /** Accepted for drop-in configuration compatibility; the backend never routes a model. */
     summarizationModel?: string;
-    /** Total cap for one compiled checkpoint, in compiler tokens. Default 8192. */
+    /** Deprecated — accepted for drop-in compatibility but ignored (no budget floor anymore). */
     maxTokens?: number;
-    /**
-     * Effective-cap fraction of the shadowed token count: the compiled
-     * checkpoint is capped at max(maxTokens, shadowed × checkpointScale),
-     * ceilinged at checkpointCap. Default 0.1.
-     */
+    /** Deprecated — accepted for drop-in compatibility but ignored (no proportional scaling anymore). */
     checkpointScale?: number;
-    /** Absolute ceiling for the scaled checkpoint cap, in compiler tokens. Default 65536. */
+    /** Total budget for one compiled checkpoint, in compiler tokens. Default 65536. */
     checkpointCap?: number;
     /** Automatic compaction retry attempts per threshold crossing. Default 1. */
     compactionRetries?: number;
@@ -96,7 +92,9 @@ export interface ResolvedInstantCompactionConfig {
     readonly retainTokens?: number;
     readonly manualRetainRatio: number;
     readonly manualRetainTokens?: number;
+    /** Deprecated — carried for drop-in compatibility; the checkpoint budget is the cap alone. */
     readonly maxTokens: number;
+    /** Deprecated — carried for drop-in compatibility; the checkpoint budget is the cap alone. */
     readonly checkpointScale: number;
     readonly checkpointCap: number;
     readonly compactionRetries: number;
@@ -176,7 +174,7 @@ export declare class InstantCompactionEngine extends CompactionEngineBase {
     static Config: z<InstantCompactionConfig>;
     readonly config: ResolvedInstantCompactionConfig;
     constructor(ctx: Context, config?: InstantCompactionConfig);
-    /** Resolve the effective total cap for one compiled checkpoint. */
+    /** Resolve the total budget for one compiled checkpoint: always `checkpointCap`. */
     effectiveMaxTokens(shadowedTokenCount: number): number;
     /** Compile one priced region with the deterministic compiler; the sole subclass hook. */
     compile(prepared: {

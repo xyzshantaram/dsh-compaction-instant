@@ -54,9 +54,8 @@ Recall 能取回**一切**：文本、推理过程、工具调用的完整参数
 | `manualRetainRatio` | `0.05` | 手动 `/compact` 时保留当前对话的比例（保证正在聊的内容不会被收走） |
 | `manualRetainTokens` | — | 手动模式直接指定保留 token 数；与 `manualRetainRatio` 二选一 |
 | `auto` | `true` | 开启自动压缩：监听 `agent/pre-step` 压力事件和 `agent/request-error` 溢出恢复 |
-| `maxTokens` | `8192` | 单个检查点总预算的下限（按内容密度估算的 token） |
-| `checkpointScale` | `0.1` | 实际预算 = `max(maxTokens, 被压缩掉的 token 数 × checkpointScale)`，再封顶于 `checkpointCap`——内容很多时不会把每条都压成一句话 |
-| `checkpointCap` | `65536` | 检查点预算的封顶值 |
+| `checkpointCap` | `65536` | 单个检查点的编译预算（估算 token）：更小的会话近乎无损地保留，更大的内容则省略到该上限 |
+| `maxTokens` / `checkpointScale` | `8192` / `0.1` | **已弃用**——仅为兼容旧配置而接受，**不再起作用**：预算就是 cap 本身（无保底、无比例缩放） |
 | `textTokens` | `512` | 每条助手文本的预算 |
 | `userTextTokens` | `1024` | 每条用户文本的预算 |
 | `toolCallTokens` | `128` | 每个工具调用单行的预算（这个永远不缩放——见下面的省略规则） |
@@ -75,7 +74,7 @@ recall 工具和命令插件各自接受 `{ maxRecallTokens?: 16000, maxSearchHi
 
 > **Cordis 配置坑：** 插件行的配置要经过 schemastery schema 校验，它的 `~standard` 适配器会给**每个没写的数组项注入 `[]`**（`toolArgTools`、`hideTools`、`noisePatterns`、`toolKeyFields`、`modelPolicies`）。本引擎把空数组当作"没设置"，会回退到默认值——所以不写 `toolArgTools` 就自动用内置白名单（千万别用 `toolArgTools: []` 想关掉它；空 = 默认）。`debug: true` 会把每次压缩的诊断写进 `debugLogPath` 指定的文件（默认 `$DSH_HOME/compaction-debug.log`）。
 
-预算有两道保险：按 token 数限制，再按"预算 × 4"的字符数限制——所以再长的连续字符串（base64 大块、压缩过的文件）也绕不过去。工具调用**永远是单行**：不会缩放，预算不够时只压缩对话文本（每条最少留 **32 token**）。如果压缩结果还是超过（缩放后的）预算，先删最旧的**工具行**（`[N tool/result entries elided: seqs a-b]`），再删其余最旧的条目（`[N earlier entries elided: seqs a-b]`）——工具调用永远挤不掉对话。最新的内容总能保住。
+预算有两道保险：按 token 数限制，再按"预算 × 4"的字符数限制——所以再长的连续字符串（base64 大块、压缩过的文件）也绕不过去。工具调用**永远是单行**：不会缩放，预算不够时只压缩对话文本（每条最少留 **32 token**）。如果压缩结果还是超过预算，先删最旧的**工具行**（`[N tool/result entries elided: seqs a-b]`），再删其余最旧的条目（`[N earlier entries elided: seqs a-b]`）——工具调用永远挤不掉对话。最新的内容总能保住。
 
 ### 浏览器设置卡片（设置 → 插件）
 
@@ -83,13 +82,11 @@ recall 工具和命令插件各自接受 `{ maxRecallTokens?: 16000, maxSearchHi
 
 | 字段 | 含义 |
 |---|---|
-| `checkpointScale` | 压缩预算 = 被压缩 token 数 × 此比例 |
-| `checkpointCap` | 缩放后预算的绝对封顶 |
-| `maxTokens` | 一次编译检查点的总 token 上限 |
+| `checkpointCap` | 单个检查点的编译预算（默认 65536） |
 | `auto` | 注册步骤间自动压缩 |
 | `thresholdRatio` | 触发自动压缩的上下文窗口占比（默认 `0.5`） |
 
-其余字段（`modelPolicies`、`toolArgTools`、`debug`、`debugLogPath` 等）仍只由 cordis 配置管理。设置层永远弄不坏引擎：每次设置写入都会先经过完整配置解析器的重新校验才会持久化；未暴露的配置字段保持组合层的值。没有 settings 服务时引擎行为与之前完全一致（只看组合配置）。卡片注册在客户端 bundle 上，所以只要装上这个包就会出现，无需改任何部署配置——**重启一次 `dsh web`** 让启动图拾取 `dsh.client` bundle 即可。
+其余字段（`modelPolicies`、`toolArgTools`、`debug`、`debugLogPath`、已弃用的 `maxTokens`/`checkpointScale` 等）仍只由 cordis 配置管理。设置层永远弄不坏引擎：每次设置写入都会先经过完整配置解析器的重新校验才会持久化；未暴露的配置字段保持组合层的值。没有 settings 服务时引擎行为与之前完全一致（只看组合配置）。卡片注册在客户端 bundle 上，所以只要装上这个包就会出现，无需改任何部署配置——**重启一次 `dsh web`** 让启动图拾取 `dsh.client` bundle 即可。
 
 ### 分词与多语言
 
@@ -131,7 +128,7 @@ recall 工具和命令插件各自接受 `{ maxRecallTokens?: 16000, maxSearchHi
 - **思考过程不保留**——reasoning 增量整体省略（有标记，不是悄悄丢）。
 - **对话文本近乎无损**——纯文本对照组保留了 68.3%；文本上那约 1.5 倍压缩基本是剥掉 JSON 包装，外加只截断最长的几段。
 
-预算扫描（同一个 252 万 tokens 的工具密集会话）：从 cap ≈ 22.6 万 tokens（原文的 9%，正好接近默认 `checkpointScale` 0.1，但被 64K 硬顶截断）才开始丢条目。低于这个值代价是**悬崖不是斜坡**：
+预算扫描（同一个 252 万 tokens 的工具密集会话）：默认 64K 上限下，编译视图约 5.6 万 tokens（原文的 2.2%）。只有把上限压到约 22.6 万 tokens 的"完全不丢"阈值以下才开始丢条目——代价是**悬崖不是斜坡**：
 
 | Cap | 编译后 | 保留 | 条目数 | 被丢 |
 |---|---|---|---|---|

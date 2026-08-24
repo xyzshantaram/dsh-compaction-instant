@@ -111,9 +111,7 @@ export class TargetPressureConfigError extends Error {
  */
 function pickSettingsFields(config) {
   return {
-    ...config.checkpointScale !== undefined ? { checkpointScale: config.checkpointScale } : {},
     ...config.checkpointCap !== undefined ? { checkpointCap: config.checkpointCap } : {},
-    ...config.maxTokens !== undefined ? { maxTokens: config.maxTokens } : {},
     ...config.auto !== undefined ? { auto: config.auto } : {},
     ...config.thresholdRatio !== undefined ? { thresholdRatio: config.thresholdRatio } : {}
   };
@@ -481,9 +479,7 @@ export class InstantCompactionEngine extends CompactionEngine {
    * engine-config-only (`debug`, `debugLogPath`, `DSH_COMPACTION_DEBUG`).
    */
   static SETTINGS_SCHEMA = z.object({
-    checkpointScale: z.number().min(0).max(1).default(DEFAULT_CHECKPOINT_SCALE),
     checkpointCap: z.number().step(1).min(1).default(DEFAULT_CHECKPOINT_CAP),
-    maxTokens: z.number().step(1).min(1).default(DEFAULT_MAX_TOKENS),
     auto: z.boolean().default(true),
     thresholdRatio: z.number().min(0).max(1).default(DEFAULT_THRESHOLD_RATIO)
   });
@@ -623,15 +619,16 @@ export class InstantCompactionEngine extends CompactionEngine {
     };
   }
   /**
-   * Resolve the total cap for one compiled checkpoint: the configured
-   * `maxTokens` is the floor, but the cap scales with the shadowed span
-   * (`checkpointScale` × shadowed tokens, ceilinged at `checkpointCap`), so a
-   * large conversation never crushes every entry into an unreadable sliver.
-   * @param shadowedTokenCount - priced token count of the span being replaced.
-   * @returns the effective cap in compiler tokens.
+   * Resolve the total cap for one compiled checkpoint: always the configured
+   * `checkpointCap` (default 65536 compiler tokens). The old proportional
+   * scaling (`checkpointScale`) and floor (`maxTokens`) were removed — a
+   * checkpoint either fits under the cap (near-lossless) or elides down to it.
+   * @param shadowedTokenCount - retained for subclass override signature
+   * parity; the cap no longer scales with the shadowed span.
+   * @returns the cap in compiler tokens.
    */
   effectiveMaxTokens(shadowedTokenCount) {
-    return Math.min(this.config.checkpointCap, Math.max(this.config.maxTokens, Math.floor(shadowedTokenCount * this.config.checkpointScale)));
+    return this.config.checkpointCap;
   }
   /**
    * Compile one priced region with the deterministic VCC-style compiler.

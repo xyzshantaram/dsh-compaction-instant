@@ -107,19 +107,18 @@ test("compile() aborts on a cancelled signal", async () => {
   );
 });
 
-test("compile() scales the checkpoint cap with the shadowed span", async () => {
+test("compile() caps the checkpoint at checkpointCap", async () => {
   const session = makeIdleSession();
   const ctx = new Context();
   ctx.provide("tokenMeter", {
     measure: () => ({ nodes: [] }),
     estimateMessage: () => 10
   });
-  // A tiny configured cap is overridden by checkpointScale × shadowed tokens,
-  // so a large span is never crushed into an unreadable sliver.
+  // The total budget for one checkpoint is exactly `checkpointCap` — no
+  // proportional scaling, no floor — so a small span compiles near-losslessly
+  // under the cap and a huge span elides down to it.
   const engine = new InstantCompactionEngine(ctx, {
     auto: false,
-    maxTokens: 64,
-    checkpointScale: 1,
     checkpointCap: 4096,
     textTokens: 512,
     userTextTokens: 1024,
@@ -144,8 +143,12 @@ test("compile() scales the checkpoint cap with the shadowed span", async () => {
     selectedNodes: [],
     shadowedTokenCount: 2000
   };
+  // The budget is the cap regardless of the shadowed span size.
+  assert.equal(engine.effectiveMaxTokens(2000), 4096);
+  assert.equal(engine.effectiveMaxTokens(1_000_000), 4096);
   const result = await engine.compile(prepared, undefined, undefined);
-  // The scaled cap (2000 tokens) lets the long user text survive untruncated.
+  // 2000 priced tokens fit under the 4096 cap, so the long user text survives
+  // untruncated.
   const text = result.entries.map((entry) => entry.text).join("\n");
   assert.match(text, /word word word/);
   assert.ok(text.length > 400, `long text survived (${text.length} chars)`);

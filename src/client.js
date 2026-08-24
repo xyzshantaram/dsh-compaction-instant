@@ -78,12 +78,8 @@ function instantCompactionClientFactory(require) {
   var zh = {
     title: "即时压缩",
     description: "VCC 式即时压缩引擎（dsh-compaction-instant）的参数。",
-    checkpointScale: "检查点缩放比例",
-    checkpointScaleHint: "压缩预算 = 被压缩的 token 数 × 此比例（默认 0.1）。",
     checkpointCap: "检查点预算上限",
-    checkpointCapHint: "缩放后预算的绝对封顶（默认 65536）。",
-    maxTokens: "单次检查点总上限",
-    maxTokensHint: "一次编译检查点的总 token 上限（默认 8192）。",
+    checkpointCapHint: "一次检查点的编译预算上限（默认 65536）。",
     auto: "自动压缩",
     autoHint: "步骤间按上下文压力自动压缩；关闭后仅手动 /compact。",
     thresholdRatio: "自动压缩比例",
@@ -103,12 +99,8 @@ function instantCompactionClientFactory(require) {
   var en = {
     title: "Instant Compaction",
     description: "VCC-style instant compaction engine (dsh-compaction-instant) tuning.",
-    checkpointScale: "Checkpoint scale",
-    checkpointScaleHint: "Checkpoint budget = shadowed tokens × this ratio (default 0.1).",
     checkpointCap: "Checkpoint cap",
-    checkpointCapHint: "Absolute ceiling of the scaled budget (default 65536).",
-    maxTokens: "Max tokens per checkpoint",
-    maxTokensHint: "Total compiler-token cap for one checkpoint (default 8192).",
+    checkpointCapHint: "Total compiler-token budget for one checkpoint (default 65536).",
     auto: "Automatic compaction",
     autoHint: "Compress automatically between steps by pressure; off means manual /compact only.",
     thresholdRatio: "Auto-compaction ratio",
@@ -417,19 +409,6 @@ function instantCompactionClientFactory(require) {
             { className: "dsci_body" },
             !state.writable ? React.createElement("p", { className: "dsci_readOnly", role: "status" }, t("readOnly")) : null,
             React.createElement(ValueField, {
-              id: "plugin-config-instant-scale",
-              label: t("checkpointScale"),
-              hint: t("checkpointScaleHint"),
-              overriddenLabel: t("overridden"),
-              resetLabel: t("reset"),
-              invalidLabel: t("invalidNumber"),
-              numeric: true,
-              disabled: !state.writable,
-              ...state.checkpointScale,
-              onEdit: function (text) { props.edit("checkpointScale", text); },
-              onReset: function () { props.resetField("checkpointScale"); }
-            }),
-            React.createElement(ValueField, {
               id: "plugin-config-instant-cap",
               label: t("checkpointCap"),
               hint: t("checkpointCapHint"),
@@ -441,19 +420,6 @@ function instantCompactionClientFactory(require) {
               ...state.checkpointCap,
               onEdit: function (text) { props.edit("checkpointCap", text); },
               onReset: function () { props.resetField("checkpointCap"); }
-            }),
-            React.createElement(ValueField, {
-              id: "plugin-config-instant-max-tokens",
-              label: t("maxTokens"),
-              hint: t("maxTokensHint"),
-              overriddenLabel: t("overridden"),
-              resetLabel: t("reset"),
-              invalidLabel: t("invalidNumber"),
-              numeric: true,
-              disabled: !state.writable,
-              ...state.maxTokens,
-              onEdit: function (text) { props.edit("maxTokens", text); },
-              onReset: function () { props.resetField("maxTokens"); }
             }),
             React.createElement(ToggleField, {
               id: "plugin-config-instant-auto",
@@ -512,9 +478,7 @@ function instantCompactionClientFactory(require) {
     var t = ctx.locale.bind(NS);
     ctx.effect(function () { return ctx.locale.register(NS, { zh: zh, en: en }); }, "compaction-instant: settings dictionary");
     var controller = new CardController(ctx.settingsScope.bind({ namespace: SETTINGS_NAMESPACE }), [
-      numberField("checkpointScale"),
       numberField("checkpointCap"),
-      numberField("maxTokens"),
       booleanField("auto"),
       numberField("thresholdRatio")
     ]);
@@ -522,9 +486,7 @@ function instantCompactionClientFactory(require) {
       var shell = controller.shell();
       return {
         ...shell,
-        checkpointScale: controller.field("checkpointScale"),
         checkpointCap: controller.field("checkpointCap"),
-        maxTokens: controller.field("maxTokens"),
         auto: controller.field("auto"),
         thresholdRatio: controller.field("thresholdRatio")
       };

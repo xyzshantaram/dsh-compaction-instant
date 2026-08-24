@@ -56,9 +56,8 @@ All fields optional; defaults shown.
 | `manualRetainRatio` | `0.05` | Fraction of the measured surface kept verbatim by a manual `/compact` (so the recent conversation is never compiled away) |
 | `manualRetainTokens` | — | Exact manual tail budget; mutually exclusive with `manualRetainRatio` |
 | `auto` | `true` | Register `agent/pre-step` pressure and `agent/request-error` overflow recovery |
-| `maxTokens` | `8192` | Floor of the total cap for one compiled checkpoint (density-aware tokens) |
-| `checkpointScale` | `0.1` | The effective cap is `max(maxTokens, shadowed × checkpointScale)`, ceilinged at `checkpointCap` — a large span never crushes every entry into a sliver |
-| `checkpointCap` | `65536` | Absolute ceiling of the scaled checkpoint cap |
+| `checkpointCap` | `65536` | Total budget for one compiled checkpoint (compiler tokens): a checkpoint compiled from a smaller span stays near-lossless, a larger one elides down to this cap |
+| `maxTokens` / `checkpointScale` | `8192` / `0.1` | **Deprecated** — accepted for drop-in compatibility but **ignored**: the budget is the cap alone (no floor, no proportional scaling) |
 | `textTokens` | `512` | Budget per assistant text block |
 | `userTextTokens` | `1024` | Budget per user text block |
 | `toolCallTokens` | `128` | Budget per tool-call one-liner (never rescaled — see the elision rules) |
@@ -77,7 +76,7 @@ The tool and command plugins each take their own `{ maxRecallTokens?: 16000, max
 
 > **Cordis config gotcha:** the plugin row's config passes through the schemastery schema, whose `~standard` adapter injects **`[]` for every absent array key** (`toolArgTools`, `hideTools`, `noisePatterns`, `toolKeyFields`, `modelPolicies`). The resolver treats an empty list as *unset* and falls back to the defaults — so a missing `toolArgTools` keeps the built-in whitelist (never disable it by writing `toolArgTools: []`; empty means default). `debug: true` writes per-compile diagnostics to the configured `debugLogPath` (default `$DSH_HOME/compaction-debug.log`).
 
-Budgets are enforced twice — by token count and by a `budget × 4` character ceiling — so pathological unbroken runs (base64 blobs, minified files) cannot bypass them. Tool calls are **always one line**: they are never rescaled, and the cap loop shrinks only the conversation-text budgets (floor **32 tokens** each). If the compiled region still exceeds the (scaled) cap, the oldest **tool rows** are removed first (`[N tool/result entries elided: seqs a-b]`), and only then the oldest remaining entries (`[N earlier entries elided: seqs a-b]`) — tool calls can never squeeze the dialogue out. The newest content always survives.
+Budgets are enforced twice — by token count and by a `budget × 4` character ceiling — so pathological unbroken runs (base64 blobs, minified files) cannot bypass them. Tool calls are **always one line**: they are never rescaled, and the cap loop shrinks only the conversation-text budgets (floor **32 tokens** each). If the compiled region still exceeds the cap, the oldest **tool rows** are removed first (`[N tool/result entries elided: seqs a-b]`), and only then the oldest remaining entries (`[N earlier entries elided: seqs a-b]`) — tool calls can never squeeze the dialogue out. The newest content always survives.
 
 ### Browser settings card (Settings → Plugins)
 
@@ -85,13 +84,11 @@ Since 0.1.4 the engine exposes a **user-owned settings namespace** (`compaction-
 
 | Field | Meaning |
 |---|---|
-| `checkpointScale` | Checkpoint budget = shadowed tokens × this ratio |
-| `checkpointCap` | Absolute ceiling of the scaled budget |
-| `maxTokens` | Total compiler-token cap for one checkpoint |
+| `checkpointCap` | Total compiler-token budget for one checkpoint (default 65536) |
 | `auto` | Register automatic between-step compaction |
 | `thresholdRatio` | Context-window fraction that triggers automatic compaction (default `0.5`) |
 
-Everything else (`modelPolicies`, `toolArgTools`, `debug`, `debugLogPath`, …) stays cordis-config-only. The settings layer never breaks the engine: every settings write is re-validated by the full config resolver before it is persisted, and non-exposed entry fields keep their composed values. Without a settings service the engine behaves exactly as before (composition entry only). The card is registered on the client bundle, so it appears without touching any deployment config beyond installing the package — restart `dsh web` once so the boot graph picks up the `dsh.client` bundle.
+Everything else (`modelPolicies`, `toolArgTools`, `debug`, `debugLogPath`, the deprecated `maxTokens`/`checkpointScale`, …) stays cordis-config-only. The settings layer never breaks the engine: every settings write is re-validated by the full config resolver before it is persisted, and non-exposed entry fields keep their composed values. Without a settings service the engine behaves exactly as before (composition entry only). The card is registered on the client bundle, so it appears without touching any deployment config beyond installing the package — restart `dsh web` once so the boot graph picks up the `dsh.client` bundle.
 
 ### Tokenizer and multilingual behavior
 
@@ -133,7 +130,7 @@ Where the ratio comes from (no drops):
 - **Reasoning text is not retained** — reasoning deltas are elided entirely (marked, never silent).
 - **Conversation text is nearly lossless** — the pure-text control retained 68.3%; the ~1.5x on text is mostly JSON wrapper stripping plus truncation of only the longest blocks.
 
-Budget scan (same 2.5M-token tool-dense session): dropping starts at a cap of ~226K tokens (9% of the raw size — close to the default `checkpointScale` of 0.1, but the 64K hard cap cuts it short). Below that the cost is a cliff, not a slope:
+Budget scan (same 2.5M-token tool-dense session): with the 64K default cap, the compiled view lands at ~56K tokens (2.2% of the raw size). Dropping starts only as the cap shrinks below the no-drop threshold of ~226K tokens — a lower cap costs a cliff, not a slope:
 
 | Cap | Compiled | Retained | Entries | Dropped |
 |---|---|---|---|---|
