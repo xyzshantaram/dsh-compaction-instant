@@ -19,9 +19,7 @@ test("SETTINGS_SCHEMA defaults mirror engine defaults", () => {
   assert.equal(resolved.checkpointCap, 65536);
   assert.equal(resolved.maxTokens, 8192);
   assert.equal(resolved.auto, true);
-  // Environment-derived engine defaults are not baked into the schema.
-  assert.equal(resolved.debug, undefined);
-  assert.equal(resolved.debugLogPath, undefined);
+  assert.equal(resolved.thresholdRatio, 0.5);
 });
 
 test("SETTINGS_SCHEMA validates user overrides and rejects malformed values", () => {
@@ -29,11 +27,12 @@ test("SETTINGS_SCHEMA validates user overrides and rejects malformed values", ()
   assert.equal(schema({ checkpointScale: 0.25 }).checkpointScale, 0.25);
   assert.equal(schema({ checkpointCap: 131072 }).checkpointCap, 131072);
   assert.equal(schema({ auto: false }).auto, false);
-  assert.equal(schema({ debug: true }).debug, true);
-  assert.equal(schema({ debugLogPath: "/tmp/x.log" }).debugLogPath, "/tmp/x.log");
+  assert.equal(schema({ thresholdRatio: 0.25 }).thresholdRatio, 0.25);
   assert.throws(() => schema({ checkpointCap: -1 }));
   assert.throws(() => schema({ checkpointCap: 1.5 }));
   assert.throws(() => schema({ checkpointScale: 1.5 }));
+  assert.throws(() => schema({ thresholdRatio: 1.5 }));
+  assert.throws(() => schema({ thresholdRatio: -0.1 }));
   assert.throws(() => schema({ auto: "yes" }));
 });
 
@@ -43,11 +42,12 @@ test("settings values feed the engine through resolveConfig", () => {
   // Context satisfies the Service base; no settings service is mounted, so
   // installSettingsSection's inject callback never runs.
   const engine = new InstantCompactionEngine(new Context(), {});
-  engine.source = () => ({ checkpointCap: 131072, checkpointScale: 0.05, auto: false });
+  engine.source = () => ({ checkpointCap: 131072, checkpointScale: 0.05, auto: false, thresholdRatio: 0.6 });
   engine._reloadConfig();
   assert.equal(engine.config.checkpointCap, 131072);
   assert.equal(engine.config.checkpointScale, 0.05);
   assert.equal(engine.config.auto, false);
+  assert.equal(engine.config.thresholdRatio, 0.6);
   // Non-exposed fields keep the composition entry values under the swap.
   engine.source = () => ({ ...{ maxTokens: 4096 }, ...{ checkpointCap: 65536 } });
   engine._reloadConfig();

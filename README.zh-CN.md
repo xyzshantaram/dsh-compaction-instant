@@ -87,10 +87,9 @@ recall 工具和命令插件各自接受 `{ maxRecallTokens?: 16000, maxSearchHi
 | `checkpointCap` | 缩放后预算的绝对封顶 |
 | `maxTokens` | 一次编译检查点的总 token 上限 |
 | `auto` | 注册步骤间自动压缩 |
-| `debug` | 向日志文件写入引擎调试行 |
-| `debugLogPath` | 调试日志路径（留空 = `$DSH_HOME/compaction-debug.log`） |
+| `thresholdRatio` | 触发自动压缩的上下文窗口占比（默认 `0.5`） |
 
-其余字段（`modelPolicies`、`toolArgTools` 等）仍只由 cordis 配置管理。设置层永远弄不坏引擎：每次设置写入都会先经过完整配置解析器的重新校验才会持久化；未暴露的配置字段保持组合层的值。没有 settings 服务时引擎行为与之前完全一致（只看组合配置）。卡片注册在客户端 bundle 上，所以只要装上这个包就会出现，无需改任何部署配置——**重启一次 `dsh web`** 让启动图拾取 `dsh.client` bundle 即可。
+其余字段（`modelPolicies`、`toolArgTools`、`debug`、`debugLogPath` 等）仍只由 cordis 配置管理。设置层永远弄不坏引擎：每次设置写入都会先经过完整配置解析器的重新校验才会持久化；未暴露的配置字段保持组合层的值。没有 settings 服务时引擎行为与之前完全一致（只看组合配置）。卡片注册在客户端 bundle 上，所以只要装上这个包就会出现，无需改任何部署配置——**重启一次 `dsh web`** 让启动图拾取 `dsh.client` bundle 即可。
 
 ### 分词与多语言
 

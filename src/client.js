@@ -86,10 +86,8 @@ function instantCompactionClientFactory(require) {
     maxTokensHint: "一次编译检查点的总 token 上限（默认 8192）。",
     auto: "自动压缩",
     autoHint: "步骤间按上下文压力自动压缩；关闭后仅手动 /compact。",
-    debug: "调试日志",
-    debugHint: "向日志文件写入引擎调试行；DSH_COMPACTION_DEBUG=1 也会开启。",
-    debugLogPath: "调试日志路径",
-    debugLogPathHint: "留空使用 $DSH_HOME/compaction-debug.log。",
+    thresholdRatio: "自动压缩比例",
+    thresholdRatioHint: "上下文窗口占用达到此比例时触发自动压缩（默认 0.5）。",
     overridden: "已覆盖",
     reset: "重置",
     invalidNumber: "必须是数字",
@@ -113,10 +111,8 @@ function instantCompactionClientFactory(require) {
     maxTokensHint: "Total compiler-token cap for one checkpoint (default 8192).",
     auto: "Automatic compaction",
     autoHint: "Compress automatically between steps by pressure; off means manual /compact only.",
-    debug: "Debug log",
-    debugHint: "Write engine debug lines to the log file; DSH_COMPACTION_DEBUG=1 also enables it.",
-    debugLogPath: "Debug log path",
-    debugLogPathHint: "Empty uses $DSH_HOME/compaction-debug.log.",
+    thresholdRatio: "Auto-compaction ratio",
+    thresholdRatioHint: "Triggers automatic compaction at this fraction of the context window (default 0.5).",
     overridden: "Overridden",
     reset: "Reset",
     invalidNumber: "Must be a number",
@@ -141,17 +137,6 @@ function instantCompactionClientFactory(require) {
         if (trimmed === "") return { kind: "clear" };
         var parsed = Number(trimmed);
         return Number.isFinite(parsed) ? { kind: "set", value: parsed } : void 0;
-      }
-    };
-  }
-  /** A free-text field; empty draft clears. */
-  function textField(field) {
-    return {
-      field,
-      format: (value) => typeof value === "string" ? value : "",
-      parse: (text) => {
-        var trimmed = text.trim();
-        return trimmed === "" ? { kind: "clear" } : { kind: "set", value: trimmed };
       }
     };
   }
@@ -482,29 +467,18 @@ function instantCompactionClientFactory(require) {
               onToggle: function (checked) { props.edit("auto", checked ? "true" : "false"); },
               onReset: function () { props.resetField("auto"); }
             }),
-            React.createElement(ToggleField, {
-              id: "plugin-config-instant-debug",
-              label: t("debug"),
-              hint: t("debugHint"),
-              overriddenLabel: t("overridden"),
-              resetLabel: t("reset"),
-              checked: state.debug.text === "true",
-              overridden: state.debug.overridden,
-              disabled: !state.writable,
-              onToggle: function (checked) { props.edit("debug", checked ? "true" : "false"); },
-              onReset: function () { props.resetField("debug"); }
-            }),
             React.createElement(ValueField, {
-              id: "plugin-config-instant-debug-path",
-              label: t("debugLogPath"),
-              hint: t("debugLogPathHint"),
+              id: "plugin-config-instant-threshold",
+              label: t("thresholdRatio"),
+              hint: t("thresholdRatioHint"),
               overriddenLabel: t("overridden"),
               resetLabel: t("reset"),
               invalidLabel: t("invalidNumber"),
+              numeric: true,
               disabled: !state.writable,
-              ...state.debugLogPath,
-              onEdit: function (text) { props.edit("debugLogPath", text); },
-              onReset: function () { props.resetField("debugLogPath"); }
+              ...state.thresholdRatio,
+              onEdit: function (text) { props.edit("thresholdRatio", text); },
+              onReset: function () { props.resetField("thresholdRatio"); }
             }),
             React.createElement(
               "div",
@@ -542,8 +516,7 @@ function instantCompactionClientFactory(require) {
       numberField("checkpointCap"),
       numberField("maxTokens"),
       booleanField("auto"),
-      booleanField("debug"),
-      textField("debugLogPath")
+      numberField("thresholdRatio")
     ]);
     var store = controller.bind(function () {
       var shell = controller.shell();
@@ -553,8 +526,7 @@ function instantCompactionClientFactory(require) {
         checkpointCap: controller.field("checkpointCap"),
         maxTokens: controller.field("maxTokens"),
         auto: controller.field("auto"),
-        debug: controller.field("debug"),
-        debugLogPath: controller.field("debugLogPath")
+        thresholdRatio: controller.field("thresholdRatio")
       };
     });
     ctx.slots.inject("settings.plugin.item", function* () {

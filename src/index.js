@@ -115,8 +115,7 @@ function pickSettingsFields(config) {
     ...config.checkpointCap !== undefined ? { checkpointCap: config.checkpointCap } : {},
     ...config.maxTokens !== undefined ? { maxTokens: config.maxTokens } : {},
     ...config.auto !== undefined ? { auto: config.auto } : {},
-    ...config.debug !== undefined ? { debug: config.debug } : {},
-    ...config.debugLogPath !== undefined ? { debugLogPath: config.debugLogPath } : {}
+    ...config.thresholdRatio !== undefined ? { thresholdRatio: config.thresholdRatio } : {}
   };
 }
 
@@ -478,17 +477,15 @@ export class InstantCompactionEngine extends CompactionEngine {
   /**
    * Settings-exposed subset of the engine configuration. Defaults mirror the
    * engine's own `DEFAULT_*` constants so the resolved settings layer is
-   * exactly what `resolveConfig` would compute; `debug`/`debugLogPath` stay
-   * optional because their engine defaults depend on the environment
-   * (`DSH_COMPACTION_DEBUG`, `DSH_HOME`).
+   * exactly what `resolveConfig` would compute. Debug behavior stays
+   * engine-config-only (`debug`, `debugLogPath`, `DSH_COMPACTION_DEBUG`).
    */
   static SETTINGS_SCHEMA = z.object({
     checkpointScale: z.number().min(0).max(1).default(DEFAULT_CHECKPOINT_SCALE),
     checkpointCap: z.number().step(1).min(1).default(DEFAULT_CHECKPOINT_CAP),
     maxTokens: z.number().step(1).min(1).default(DEFAULT_MAX_TOKENS),
     auto: z.boolean().default(true),
-    debug: z.boolean(),
-    debugLogPath: z.string()
+    thresholdRatio: z.number().min(0).max(1).default(DEFAULT_THRESHOLD_RATIO)
   });
   /** Resolved and validated compaction configuration. */
   config;
