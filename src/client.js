@@ -243,20 +243,21 @@ function instantCompactionClientFactory(require) {
     /** Every staged edit a save would write, in staging order. */
     CardController.prototype.plan = function () {
       var plan = [];
-      for (var _i = 0, _a = Array.from(this.staged.entries()); _i < _a.length; _i++) {
-        var entry = _a[_i];
+      var entries = Array.from(this.staged.entries());
+      for (var _i = 0; _i < entries.length; _i++) {
+        var entry = entries[_i];
         var field = entry[0];
         var staged = entry[1];
         var spec = this.specs.get(field);
         if (staged.clear) {
-          if (this.stored(field)) plan.push({ field: field, run: function () { return this.clear(field); }.bind(this) });
+          if (this.stored(field)) plan.push({ field: field, run: (function (self, f) { return function () { return self.clear(f); }; })(this, field) });
           continue;
         }
         if (staged.text === spec.format(this.sectionValue(field))) continue;
         var write = spec.parse(staged.text);
         if (write === void 0) plan.push({ field: field, run: void 0 });
-        else if (write.kind === "clear") plan.push({ field: field, run: function () { return this.clear(field); }.bind(this) });
-        else plan.push({ field: field, run: function (value) { return function () { return this.store(field, value); }; }.call(this, write.value) });
+        else if (write.kind === "clear") plan.push({ field: field, run: (function (self, f) { return function () { return self.clear(f); }; })(this, field) });
+        else plan.push({ field: field, run: (function (self, f, v) { return function () { return self.store(f, v); }; })(this, field, write.value) });
       }
       return plan;
     };
@@ -559,7 +560,7 @@ function instantCompactionClientFactory(require) {
     ctx.slots.inject("settings.plugin.item", function* () {
       yield ctx.slots.register({
         name: "settings.plugin.item",
-        id: "compaction-instant",
+        key: "compaction-instant",
         order: 30,
         locale: NS,
         inject: function () {
