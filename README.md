@@ -51,10 +51,8 @@ All fields optional; defaults shown.
 | Key | Default | Meaning |
 |---|---|---|
 | `thresholdRatio` | `0.5` | Fraction of the routed model's context window that triggers automatic compaction |
-| `retainRatio` | `0.05` | Fraction of the context window kept verbatim at the surface tail |
-| `retainTokens` | — | Exact tail budget; mutually exclusive with `retainRatio` |
-| `manualRetainRatio` | `0.05` | Fraction of the measured surface kept verbatim by a manual `/compact` (so the recent conversation is never compiled away) |
-| `manualRetainTokens` | — | Exact manual tail budget; mutually exclusive with `manualRetainRatio` |
+| `retainTurns` | `1` | Preferred complete recent turns kept verbatim (automatic and manual `/compact`); never overrides the ceiling |
+| `retainTokens` | `5120` | **Hard** retained-region token ceiling: older whole turns are added only while the total fits, and when the latest turn alone exceeds it, only the fitting suffix of that turn is kept |
 | `auto` | `true` | Register `agent/pre-step` pressure and `agent/request-error` overflow recovery |
 | `checkpointCap` | `65536` | Total budget for one compiled checkpoint (compiler tokens): a checkpoint compiled from a smaller span stays near-lossless, a larger one elides down to this cap |
 | `maxTokens` / `checkpointScale` | `8192` / `0.1` | **Deprecated** — accepted for drop-in compatibility but **ignored**: the budget is the cap alone (no floor, no proportional scaling) |
@@ -68,7 +66,7 @@ All fields optional; defaults shown.
 | `toolKeyFields` | built-ins | Extra tool-name → argument-field map for one-liners |
 | `toolArgTools` | see compiler | Whitelist whose key argument renders in the one-liner (`read`/`write`/`edit`/`glob`/`grep`/`bash`/`shell`/`web_search`/`skill`/`subagent`/…); every other tool is name-only |
 | `hideTools` | — | Bookkeeping tools dropped from the checkpoint entirely |
-| `modelPolicies` | — | Per provider/model overrides of `thresholdRatio`/`retain*` (basic-compatible shape) |
+| `modelPolicies` | — | Per provider/model overrides of `thresholdRatio`/`retainTurns`/`retainTokens` |
 | `compactionRetries` / `maxOverflowRetries` | `1` / `1` | Retry budgets, same semantics as basic |
 | `summarizationProvider` / `summarizationModel` | — | Accepted for config drop-in compatibility; **inert** — this backend never routes a model |
 
@@ -87,6 +85,8 @@ Since 0.1.4 the engine exposes a **user-owned settings namespace** (`compaction-
 | `checkpointCap` | Total compiler-token budget for one checkpoint (default 65536) |
 | `auto` | Register automatic between-step compaction |
 | `thresholdRatio` | Context-window fraction that triggers automatic compaction (default `0.5`) |
+| `retainTurns` | Preferred complete recent turns kept verbatim (default `1`) |
+| `retainTokens` | **Hard** retained-token ceiling: whole turns (or, when the latest turn is larger, a fitting suffix of it) never exceed it (default `5120`) |
 
 Everything else (`modelPolicies`, `toolArgTools`, `debug`, `debugLogPath`, the deprecated `maxTokens`/`checkpointScale`, …) stays cordis-config-only. The settings layer never breaks the engine: every settings write is re-validated by the full config resolver before it is persisted, and non-exposed entry fields keep their composed values. Without a settings service the engine behaves exactly as before (composition entry only). The card is registered on the client bundle, so it appears without touching any deployment config beyond installing the package — restart `dsh web` once so the boot graph picks up the `dsh.client` bundle.
 
@@ -101,7 +101,7 @@ The tokenizer is a character-class heuristic: ASCII letter runs and digit runs c
 | Accented Latin (`café`) | ASCII runs stay grouped (`caf` + `é`) |
 | Emoji (`😀`) | 2 (surrogate pair) |
 
-Every truncation, excerpt, and cap cut is taken at a **code-point boundary** — a slice never leaves a lone surrogate half, so emoji and other astral characters always reach the model intact (pinned by `test/multilang.test.js`). The character-density ceiling uses UTF-16 length, which is the conservative side for astral content.
+Every truncation, excerpt, and cap cut is taken at a **code-point boundary** — a slice never leaves a lone surrogate half, so emoji and other astral characters always reach the model intact (pinned by `test/multilang.test.js`). The character-density ceiling follows the DeepSeek docs conversion (quick_start/token_usage): about 0.3 tokens per non-CJK character and 0.6 per CJK character.
 
 The harness token meter (used for the shrink guarantee and `/compact` reporting) is a separate `chars / 4 + block overhead` estimator; the two deliberately coexist — see the top-level design notes.
 
@@ -244,8 +244,8 @@ The package is dependency-light: `@deepseek-ai/schemastery` for the Config schem
 - No rephrasing → facts, file paths, commands, and identifiers survive byte-exact; the model continues on its own words.
 - Deterministic → the same region always compiles to the same checkpoint.
 - Prior checkpoints are copied verbatim instead of being re-summarized (cheap and lossless).
-- Manual `/compact` keeps a verbatim recent tail (`manualRetainRatio`, default 0.05 of the measured surface) instead of compiling the whole history, so the active conversation is never compacted away; the compiled checkpoint only covers the older span.
+- Manual `/compact` and automatic pressure compaction both keep a verbatim recent tail capped by `retainTokens` (whole turns first; a latest turn larger than the ceiling keeps only its fitting suffix) instead of compiling the whole history, so the active conversation is never compacted away; the compiled checkpoint only covers the older span.
 - The `compaction/summary` event carries the **compiled entries themselves** — the UI's expandable checkpoint row shows exactly the body the model sees, wrapped in an **adaptive Markdown code fence** (the fence grows longer than any ``` inside, so messages containing markdown render as one tidy code block), and the checkpoint heads with a short RECALL guide telling the model how to recover elided content via `recall` / `search`.
-- Trade-off: the checkpoint can be less *dense* than an LLM summary for prose-heavy history (facts are truncated, not merged). The verbatim tail (automatic `retainRatio` and manual `manualRetainRatio`) is where active work lives, and everything else stays recoverable through `(seq N)` pointers + recall.
+- Trade-off: the checkpoint can be less *dense* than an LLM summary for prose-heavy history (facts are truncated, not merged). The verbatim tail (`retainTurns`/`retainTokens`) is where active work lives, and everything else stays recoverable through `(seq N)` pointers + recall.
 
 MIT licensed.

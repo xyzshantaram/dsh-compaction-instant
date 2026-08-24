@@ -49,10 +49,8 @@ Recall 能取回**一切**：文本、推理过程、工具调用的完整参数
 | 键 | 默认 | 含义 |
 |---|---|---|
 | `thresholdRatio` | `0.5` | 上下文用到多大比例时自动触发压缩（0.5 = 用到一半） |
-| `retainRatio` | `0.05` | 对话最新的一段（按窗口比例）一字不差地保留，不压缩 |
-| `retainTokens` | — | 直接指定保留多少 token；与 `retainRatio` 二选一 |
-| `manualRetainRatio` | `0.05` | 手动 `/compact` 时保留当前对话的比例（保证正在聊的内容不会被收走） |
-| `manualRetainTokens` | — | 手动模式直接指定保留 token 数；与 `manualRetainRatio` 二选一 |
+| `retainTurns` | `1` | 优先保留的完整回合数（自动压缩和手动 `/compact` 都按此规则；不突破上限） |
+| `retainTokens` | `5120` | 保留区 token **硬上限**：向前补足完整回合时总量永不超出；若最近回合本身就超过它，只保留该回合内能装下的部分 |
 | `auto` | `true` | 开启自动压缩：监听 `agent/pre-step` 压力事件和 `agent/request-error` 溢出恢复 |
 | `checkpointCap` | `65536` | 单个检查点的编译预算（估算 token）：更小的会话近乎无损地保留，更大的内容则省略到该上限 |
 | `maxTokens` / `checkpointScale` | `8192` / `0.1` | **已弃用**——仅为兼容旧配置而接受，**不再起作用**：预算就是 cap 本身（无保底、无比例缩放） |
@@ -66,7 +64,7 @@ Recall 能取回**一切**：文本、推理过程、工具调用的完整参数
 | `toolKeyFields` | 内置 | 额外的"工具名 → 参数里的关键字段"映射，用于单行展示 |
 | `toolArgTools` | 见 compiler | 白名单：这些工具的关键参数会显示在单行里（`read`/`write`/`edit`/`glob`/`grep`/`bash`/`shell`/`web_search`/`skill`/`subagent`/…）；其余工具只显示名字 |
 | `hideTools` | — | 完全从检查点里去掉的内部管理工具 |
-| `modelPolicies` | — | 按 provider/model 单独覆盖 `thresholdRatio`/`retain*`（与官方配置格式一致） |
+| `modelPolicies` | — | 按 provider/model 单独覆盖 `thresholdRatio`/`retainTurns`/`retainTokens` |
 | `compactionRetries` / `maxOverflowRetries` | `1` / `1` | 重试次数，含义和官方引擎一样 |
 | `summarizationProvider` / `summarizationModel` | — | 仅为兼容官方配置而接受；**不起作用**——本引擎从不调用模型 |
 
@@ -85,6 +83,8 @@ recall 工具和命令插件各自接受 `{ maxRecallTokens?: 16000, maxSearchHi
 | `checkpointCap` | 单个检查点的编译预算（默认 65536） |
 | `auto` | 注册步骤间自动压缩 |
 | `thresholdRatio` | 触发自动压缩的上下文窗口占比（默认 `0.5`） |
+| `retainTurns` | 优先保留的完整回合数（默认 `1`；不突破上限） |
+| `retainTokens` | 保留区 token **硬上限**，补足回合或截取最近回合时永不超出（默认 `5120`） |
 
 其余字段（`modelPolicies`、`toolArgTools`、`debug`、`debugLogPath`、已弃用的 `maxTokens`/`checkpointScale` 等）仍只由 cordis 配置管理。设置层永远弄不坏引擎：每次设置写入都会先经过完整配置解析器的重新校验才会持久化；未暴露的配置字段保持组合层的值。没有 settings 服务时引擎行为与之前完全一致（只看组合配置）。卡片注册在客户端 bundle 上，所以只要装上这个包就会出现，无需改任何部署配置——**重启一次 `dsh web`** 让启动图拾取 `dsh.client` bundle 即可。
 
@@ -99,7 +99,7 @@ recall 工具和命令插件各自接受 `{ maxRecallTokens?: 16000, maxSearchHi
 | 带重音拉丁文（`café`） | 英文部分成组（`caf` + `é`） |
 | Emoji（`😀`） | 2（一个 emoji 占两个 UTF-16 单元） |
 
-所有截断都发生在**字符边界**——绝不会把一个 emoji 从中间切开（有 `test/multilang.test.js` 保证）。字符数上限按 UTF-16 长度算，对 emoji 这类字符偏保守。
+所有截断都发生在**字符边界**——绝不会把一个 emoji 从中间切开（有 `test/multilang.test.js` 保证）。字符密度上限按 DeepSeek 官方换算（token_usage 文档）：约每个非中日韩字符 0.3 token、每个中日韩字符 0.6 token。
 
 另外，Harness 自带的 token 计量器（用于"压缩后必须变小"的检查、`/compact` 的用量报告）用的是另一套 `字符数 / 4 + 固定开销` 的估算，两套算法故意并存——详见设计说明。
 
@@ -242,8 +242,8 @@ npm run check   # 对所有源码做 node --check
 - 不改写 → 事实、文件路径、命令、变量名都一字不差；模型继续用自己的话接着聊。
 - 确定性 → 同样的内容永远压缩出同样的检查点。
 - 之前的检查点原样保留，而不是重新摘要一遍（又快又无损）。
-- 手动 `/compact` 会保留最近的一小段原文（`manualRetainRatio`，默认保留当前对话的 0.05）而不是压缩全部历史，正在聊的内容永远不会被收走；只有更早的部分进检查点。
+- 手动 `/compact` 和自动压力压缩都会保留最近的一段原文（优先整回合，`retainTokens` 为**硬上限**：补足整回合时总量永不超出；若最近回合本身就超过上限，只保留该回合内能装下的部分）而不是压缩全部历史，正在聊的内容永远不会被收走；只有更早的部分进检查点。
 - `compaction/summary` 事件携带**压缩后的条目本身**——UI 里可展开的检查点行显示的就是模型实际看到的内容，外面包一层**能自动变长的代码框**（框线永远比内容里的 ``` 长，所以含 markdown 的消息也能整齐地显示成一个代码块），检查点开头还有一段简短的使用指南，告诉模型怎么用 `recall` / `search` 找回被省略的内容。
-- 权衡：对以长对话、叙述为主的历史，检查点的信息密度可能不如 LLM 摘要（长句是截断而不是合并）。正在进行的对话有逐字保留的尾部（自动 `retainRatio` 和手动 `manualRetainRatio`）兜底，其余内容都能通过 `(seq N)` 指针 + recall 找回来。
+- 权衡：对以长对话、叙述为主的历史，检查点的信息密度可能不如 LLM 摘要（长句是截断而不是合并）。正在进行的对话有逐字保留的尾部（`retainTurns`/`retainTokens`）兜底，其余内容都能通过 `(seq N)` 指针 + recall 找回来。
 
 MIT 许可证。

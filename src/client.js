@@ -84,6 +84,10 @@ function instantCompactionClientFactory(require) {
     autoHint: "步骤间按上下文压力自动压缩；关闭后仅手动 /compact。",
     thresholdRatio: "自动压缩比例",
     thresholdRatioHint: "上下文窗口占用达到此比例时触发自动压缩（默认 0.5）。",
+    retainTurns: "保留回合数",
+    retainTurnsHint: "优先保留最近 N 个完整回合（默认 1）。",
+    retainTokens: "保留 token 上限",
+    retainTokensHint: "保留区 token 硬上限：补足回合时永不超出；若最近回合本身就超过它，只保留其中能装下的部分（默认 5120）。",
     overridden: "已覆盖",
     reset: "重置",
     invalidNumber: "必须是数字",
@@ -105,6 +109,10 @@ function instantCompactionClientFactory(require) {
     autoHint: "Compress automatically between steps by pressure; off means manual /compact only.",
     thresholdRatio: "Auto-compaction ratio",
     thresholdRatioHint: "Triggers automatic compaction at this fraction of the context window (default 0.5).",
+    retainTurns: "Retained turns",
+    retainTurnsHint: "Prefer the last N complete turns (default 1).",
+    retainTokens: "Retained-token ceiling",
+    retainTokensHint: "Hard ceiling for the retained region: turn extension never exceeds it, and if the latest turn alone is bigger, only the part of it that fits is kept (default 5120).",
     overridden: "Overridden",
     reset: "Reset",
     invalidNumber: "Must be a number",
@@ -446,6 +454,32 @@ function instantCompactionClientFactory(require) {
               onEdit: function (text) { props.edit("thresholdRatio", text); },
               onReset: function () { props.resetField("thresholdRatio"); }
             }),
+            React.createElement(ValueField, {
+              id: "plugin-config-instant-retain-turns",
+              label: t("retainTurns"),
+              hint: t("retainTurnsHint"),
+              overriddenLabel: t("overridden"),
+              resetLabel: t("reset"),
+              invalidLabel: t("invalidNumber"),
+              numeric: true,
+              disabled: !state.writable,
+              ...state.retainTurns,
+              onEdit: function (text) { props.edit("retainTurns", text); },
+              onReset: function () { props.resetField("retainTurns"); }
+            }),
+            React.createElement(ValueField, {
+              id: "plugin-config-instant-retain-tokens",
+              label: t("retainTokens"),
+              hint: t("retainTokensHint"),
+              overriddenLabel: t("overridden"),
+              resetLabel: t("reset"),
+              invalidLabel: t("invalidNumber"),
+              numeric: true,
+              disabled: !state.writable,
+              ...state.retainTokens,
+              onEdit: function (text) { props.edit("retainTokens", text); },
+              onReset: function () { props.resetField("retainTokens"); }
+            }),
             React.createElement(
               "div",
               { className: "dsci_footer" },
@@ -480,7 +514,9 @@ function instantCompactionClientFactory(require) {
     var controller = new CardController(ctx.settingsScope.bind({ namespace: SETTINGS_NAMESPACE }), [
       numberField("checkpointCap"),
       booleanField("auto"),
-      numberField("thresholdRatio")
+      numberField("thresholdRatio"),
+      numberField("retainTurns"),
+      numberField("retainTokens")
     ]);
     var store = controller.bind(function () {
       var shell = controller.shell();
@@ -488,7 +524,9 @@ function instantCompactionClientFactory(require) {
         ...shell,
         checkpointCap: controller.field("checkpointCap"),
         auto: controller.field("auto"),
-        thresholdRatio: controller.field("thresholdRatio")
+        thresholdRatio: controller.field("thresholdRatio"),
+        retainTurns: controller.field("retainTurns"),
+        retainTokens: controller.field("retainTokens")
       };
     });
     ctx.slots.inject("settings.plugin.item", function* () {

@@ -14,7 +14,9 @@ export interface ModelPolicyOverride {
     provider: string;
     model: string;
     thresholdRatio?: number;
-    retainRatio?: number;
+    /** Mandatory complete recent turns kept verbatim for this target. */
+    retainTurns?: number;
+    /** Retained-region token ceiling for this target; never exceeded by extension. */
     retainTokens?: number;
     /** Accepted for drop-in configuration compatibility; inert in this backend. */
     summarizationProvider?: string;
@@ -28,16 +30,16 @@ export interface ModelPolicyOverride {
 
 /** Public plugin configuration, all fields optional. */
 export interface InstantCompactionConfig {
-    /** Request-pressure fraction that triggers automatic compaction. Default 0.8. */
+    /** Request-pressure fraction that triggers automatic compaction. Default 0.5. */
     thresholdRatio?: number;
-    /** Verbatim-tail retention fraction. Default 0.16. */
-    retainRatio?: number;
-    /** Exact recent-tail retention budget; mutually exclusive with retainRatio. */
+    /** Preferred complete recent turns kept verbatim; never overrides the ceiling. Default 1. */
+    retainTurns?: number;
+    /**
+     * **Hard** retained-region token ceiling: older complete turns are added
+     * only while the total fits, and when the latest turn alone exceeds it,
+     * only the fitting suffix of that turn is kept. Default 5120.
+     */
     retainTokens?: number;
-    /** Verbatim-tail fraction a manual `/compact` keeps outside the compiled span. Default 0.15. */
-    manualRetainRatio?: number;
-    /** Exact manual-compaction tail budget; mutually exclusive with manualRetainRatio. */
-    manualRetainTokens?: number;
     /** Accepted for drop-in configuration compatibility; the backend never routes a model. */
     summarizationProvider?: string;
     /** Accepted for drop-in configuration compatibility; the backend never routes a model. */
@@ -88,10 +90,8 @@ export interface InstantCompactionConfig {
 /** Resolved, validated, frozen configuration after {@link resolveConfig}. */
 export interface ResolvedInstantCompactionConfig {
     readonly thresholdRatio: number;
-    readonly retainRatio?: number;
-    readonly retainTokens?: number;
-    readonly manualRetainRatio: number;
-    readonly manualRetainTokens?: number;
+    readonly retainTurns: number;
+    readonly retainTokens: number;
     /** Deprecated — carried for drop-in compatibility; the checkpoint budget is the cap alone. */
     readonly maxTokens: number;
     /** Deprecated — carried for drop-in compatibility; the checkpoint budget is the cap alone. */
@@ -125,8 +125,6 @@ export declare class TargetPressureConfigError extends Error {
 
 /** Validate and resolve the plugin configuration. */
 export declare function resolveConfig(config?: InstantCompactionConfig): ResolvedInstantCompactionConfig;
-/** Resolve the verbatim tail a manual compaction keeps outside the compiled span. */
-export declare function resolveManualRetainTokens(config: ResolvedInstantCompactionConfig, measurement: { totalTokens: number }): number;
 /** Merge the exact provider/model override over the validated default policy. */
 export declare function resolveTargetPolicy(config: ResolvedInstantCompactionConfig, target: { provider: string; model: string }): unknown;
 /** Scale one routed policy into concrete token budgets for its model capacity. */

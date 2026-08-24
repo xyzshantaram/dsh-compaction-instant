@@ -189,7 +189,9 @@ test("engine regionDependencies drive a real manual transaction end-to-end", asy
   assert.equal(checkpoint.data.source.plugin, "compact");
   const text = checkpoint.data.content.map((block) => block.text).join("\n");
   assert.match(text, /<compacted-checkpoint>/);
+  assert.match(text, /自动压缩: 将 4 个节点 \/ ~400 tokens 编译为 \d+ 条目 \/ ~\d+ tokens/);
   assert.match(text, /## Compiled checkpoint: 4 nodes \(seqs 1-4/);
+  assert.match(text, /尾部原文保留: 1 节点 \/ ~100 tokens/);
   assert.match(text, /RECALL: /);
   assert.match(text, /recall/);
   assert.match(text, /search/);

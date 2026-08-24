@@ -10,10 +10,13 @@ import {
   compileNodes,
   compileRegion,
   countTokens,
+  estimateDeepSeekTokens,
   excerptToolResult,
   frameCheckpoint,
   isCheckpointSource,
+  isCjkChar,
   joinCompiledEntries,
+  oneLineArg,
   parseToolArguments,
   pickToolKeyArg,
   projectToolResultText,
@@ -85,6 +88,24 @@ test("pickToolKeyArg prefers the tool-specific field then any string", () => {
   assert.equal(pickToolKeyArg("read", { file_path: "x" }, { read: "other" }), "x");
 });
 
+test("estimateDeepSeekTokens applies the docs weights: 0.3 non-CJK, 0.6 CJK", () => {
+  assert.equal(estimateDeepSeekTokens("abc"), 0.9);
+  assert.equal(estimateDeepSeekTokens("你好"), 1.2);
+  assert.equal(estimateDeepSeekTokens("hi 你好!"), 2.4);
+  assert.equal(estimateDeepSeekTokens(""), 0);
+  assert.equal(isCjkChar("中"), true);
+  assert.equal(isCjkChar("a"), false);
+  assert.equal(isCjkChar("、"), true); // CJK punctuation
+  assert.equal(isCjkChar("Ａ"), true); // fullwidth form
+});
+
+test("oneLineArg collapses multiline arguments to the first line plus a cap marker", () => {
+  assert.equal(oneLineArg("ls -la"), "ls -la");
+  assert.equal(oneLineArg("grep -n foo bar/baz\n\ncat x\necho y"), "grep -n foo bar/baz [+ 3 lines]");
+  assert.equal(oneLineArg("a\r\nb"), "a [+ 1 lines]");
+  assert.equal(oneLineArg("\ncommand"), "command [+ 1 lines]");
+});
+
 test("parseToolArguments tolerates invalid JSON", () => {
   assert.deepEqual(parseToolArguments('{"a":1}'), { a: 1 });
   assert.equal(parseToolArguments("{oops"), null);
@@ -131,6 +152,20 @@ test("compileNodes collapses a tool step and elides reasoning", () => {
   assert.match(text, /\* read "a\.js" \(seq 2 -> result 3\)/);
   assert.doesNotMatch(text, /-> read: ok/);
   assert.doesNotMatch(text, /file contents/);
+});
+
+test("compileNodes renders multiline bash arguments as first line plus line count", () => {
+  const nodes = [
+    { seq: 1, message: { role: "assistant", content: [
+      { type: "tool-call", id: "c1", name: "bash", arguments: '{"command":"grep -n foo src/index.js\\n\\ncat README.md\\necho done"}' }
+    ], source: { provider: "p", model: "m" } } },
+    { seq: 2, message: { role: "user", content: [{ type: "tool-result", toolCallId: "c1", content: [{ type: "text", text: "ok" }] }] } }
+  ];
+  const { entries } = compileNodes(nodes, CONFIG);
+  const text = entries.map((entry) => entry.text).join("\n");
+  assert.match(text, /\* bash "grep -n foo src\/index\.js \[\+\s*3 lines\]" \(seq 1 -> result 2\)/);
+  assert.doesNotMatch(text, /cat README\.md/);
+  assert.doesNotMatch(text, /echo done/);
 });
 
 test("compileNodes renders name-only rows for non-whitelisted tools", () => {
@@ -268,7 +303,7 @@ test("compileRegion elides tool rows before conversation text", () => {
   // The cap binds below the rescale-converged total but above the total once
   // enough tool rows are removed, so only low-value rows may be elided — the
   // conversation text is rescaled but never removed.
-  const { entries, stats, capped } = compileRegion(nodes, { ...CONFIG, maxTokens: 450 });
+  const { entries, stats, capped } = compileRegion(nodes, { ...CONFIG, maxTokens: 565 });
   assert.ok(capped, "cap enforcement ran");
   assert.ok(stats.elidedToolRows > 0, "low-value rows were elided first");
   assert.equal(stats.elidedRows, 0, "no conversation text was elided");

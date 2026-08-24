@@ -74,16 +74,90 @@ const fakeCompile = async () => ({
   model: "test-compiler"
 });
 
-test("selectCompactableRange retains the priced tail and balances tool pairs", () => {
-  const session = makeIdleSession();
-  const measurement = makeFakeMeter().measure(session);
-  // Retaining >= 250 tokens keeps the last 3 nodes; the cut before the
-  // tool/result node is not balanced, so the range recedes to node 1 only.
-  const range = selectCompactableRange(session, measurement, 250);
-  assert.deepEqual([range.start, range.end], [1, 1]);
-  // Retaining 0 keeps only the last node; the cut before it is balanced.
-  const full = selectCompactableRange(session, measurement, 0);
-  assert.deepEqual([full.start, full.end], [1, 4]);
+/**
+ * Build one detached three-turn session:
+ * turn 1 (no tools): user + assistant;
+ * turn 2 (tools): user + assistant(tool-call) + tool/result + assistant;
+ * turn 3 (no tools): user + assistant.
+ * Every surface node prices at 100 tokens through the fake meter.
+ */
+function makeMultiTurnSession() {
+  const user = (text) => createUserMessage({
+    content: [{ type: "text", text }],
+    source: { kind: "user" }
+  });
+  const assistant = (text, content = [{ type: "text", text }]) => createAssistantMessage({
+    content,
+    source: { provider: "p", model: "m" }
+  });
+  const seed = [];
+  let seq = 0;
+  const push = (type, data, surfaceOp) => seed.push({
+    type,
+    seq: seq++,
+    time: seq,
+    data,
+    ...surfaceOp === undefined ? {} : { surfaceOp }
+  });
+  // Turn 1: seqs 1-2
+  push("turn/start", { turn: 1 });
+  push("user/message", user("please fix the bug"), "append");
+  push("assistant/message", { message: assistant("on it") }, "append");
+  push("turn/end", { turn: 1 });
+  // Turn 2: seqs 5-8
+  push("turn/start", { turn: 2 });
+  push("user/message", user("show me the file"), "append");
+  push("assistant/message", { message: assistant("reading", [
+    { type: "text", text: "reading" },
+    { type: "tool-call", id: "call-1", name: "read", arguments: '{"file_path":"a.js"}' }
+  ]) }, "append");
+  push("tool/result", { message: createToolResultMessage({
+    callId: "call-1",
+    content: [{ type: "text", text: "file content" }],
+    isError: false
+  }) }, "append");
+  push("assistant/message", { message: assistant("done") }, "append");
+  push("turn/end", { turn: 2 });
+  // Turn 3: seqs 10-11
+  push("turn/start", { turn: 3 });
+  push("user/message", user("thank you"), "append");
+  push("assistant/message", { message: assistant("welcome") }, "append");
+  push("turn/end", { turn: 3 });
+  return Session.create("session-multi", seed);
+}
+
+test("selectCompactableRange retains complete turns and never exceeds the token ceiling", () => {
+  const session = makeMultiTurnSession();
+  const measurement = makeFakeMeter().measure(session); // 8 nodes × 100 tokens
+  // Default semantics: 1 mandatory turn (200 tokens), no ceiling → only turn 3 stays.
+  const one = selectCompactableRange(session, measurement, 1, 0);
+  assert.deepEqual([one.start, one.end], [1, 8]);
+  // Two mandatory turns → turns 2+3 stay, only turn 1 compiles.
+  const two = selectCompactableRange(session, measurement, 2, 0);
+  assert.deepEqual([two.start, two.end], [1, 2]);
+  // Ceiling 600 = exactly last two turns (turn 3: 200 + turn 2: 400) → both stay.
+  const fits = selectCompactableRange(session, measurement, 1, 600);
+  assert.deepEqual([fits.start, fits.end], [1, 2]);
+  // Ceiling 599: turn 3 is 200 < 599, but adding turn 2 (400) would overshoot
+  // to 600 → never exceeds the ceiling → only turn 3 stays.
+  const capped = selectCompactableRange(session, measurement, 1, 599);
+  assert.deepEqual([capped.start, capped.end], [1, 8]);
+  // A huge ceiling retains everything compilable → nothing left to compile.
+  const huge = selectCompactableRange(session, measurement, 1, 1_000_000);
+  assert.equal(huge, null);
+  // Ceiling 150 < the latest turn alone (200): the ceiling is absolute even
+  // against the mandated turn — only the node suffix that fits stays
+  // (turn 3's last node, seq 12; the cut before it is balanced).
+  const partial = selectCompactableRange(session, measurement, 1, 150);
+  assert.deepEqual([partial.start, partial.end], [1, 11]);
+  // The preferred-turn rule never overrides the ceiling either (retainTurns=3
+  // with ceiling 100 still keeps only the last node).
+  const partialPreferred = selectCompactableRange(session, measurement, 3, 100);
+  assert.deepEqual([partialPreferred.start, partialPreferred.end], [1, 11]);
+  // Selecting with no compilable predecessor → null (single-turn session with
+  // the mandatory turn covering the whole surface).
+  const whole = selectCompactableRange(makeIdleSession(), makeFakeMeter().measure(makeIdleSession()), 1, 0);
+  assert.equal(whole, null);
 });
 
 test("compactSurfaceRegion runs a complete manual transaction with a flush", async () => {
@@ -101,8 +175,13 @@ test("compactSurfaceRegion runs a complete manual transaction with a flush", asy
   assert.deepEqual(result.shadowedSeqs, [1, 2, 3, 4]);
   assert.equal(result.shadowedTokenCount, 400);
   assert.deepEqual(result.shadowedRange, { start: 1, end: 4 });
-  // The UI-facing summary is the compiled body in one adaptive code fence.
-  assert.deepEqual(result.summary, [{ type: "text", text: "```\n[user]\ncompiled body\n```" }]);
+  // The UI-facing summary is the compiled body in one adaptive code fence,
+  // opened by a compaction intro line and closed by the retention footer.
+  const summaryText = result.summary[0].text;
+  assert.match(summaryText, /自动压缩: 将 4 个节点 \/ ~400 tokens 编译为 1 条目 \/ ~3 tokens/);
+  assert.match(summaryText, /## Compiled checkpoint: 4 nodes \(seqs 1-4, ~400 tokens\)/);
+  assert.match(summaryText, /\[user\]\ncompiled body/);
+  assert.match(summaryText, /尾部原文保留: 1 节点 \/ ~100 tokens/);
   const events = session.events;
   const startEvent = events[result.startSeq];
   const summaryEvent = events[result.summarySeq];

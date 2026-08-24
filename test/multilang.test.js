@@ -105,7 +105,7 @@ test("excerptToolResult anchors the multilingual tail and splits no pairs", () =
 
 test("estimateEntryTokens uses the max of token count and char density", () => {
   assert.equal(estimateEntryTokens("你好世界"), 4);
-  assert.equal(estimateEntryTokens("a".repeat(100)), 25);
+  assert.equal(estimateEntryTokens("a".repeat(100)), 30);
   assert.equal(estimateEntryTokens("😀"), 2);
 });
 

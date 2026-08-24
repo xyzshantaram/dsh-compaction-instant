@@ -80,6 +80,42 @@ export function tokenize(text) {
   return text.match(TOKEN_RE) ?? [];
 }
 
+/**
+ * DeepSeek's documented character→token conversion (quick_start/token_usage):
+ * about 0.3 token per English character and 0.6 token per Chinese character.
+ * The tokenizer still varies per model, so this is an estimate — the real
+ * usage comes from the model's `usage` field.
+ * @param char - one code point.
+ * @returns true when the character carries the 0.6 CJK weight.
+ */
+export function isCjkChar(char) {
+  const code = char.codePointAt(0);
+  return (
+    (code >= 0x3400 && code <= 0x4dbf) || // CJK Extension A
+    (code >= 0x4e00 && code <= 0x9fff) || // CJK Unified Ideographs
+    (code >= 0xf900 && code <= 0xfaff) || // CJK Compatibility Ideographs
+    (code >= 0x3000 && code <= 0x303f) || // CJK Symbols and Punctuation
+    (code >= 0xff00 && code <= 0xffef) // Fullwidth Forms
+  );
+}
+
+/**
+ * Estimate tokens of a text under the DeepSeek docs conversion (0.3 per
+ * non-CJK character, 0.6 per CJK character). Counts accumulate as integer
+ * tenths so long inputs stay exact under ceil.
+ * @param text - arbitrary text.
+ * @returns the estimated token count (may be fractional).
+ */
+export function estimateDeepSeekTokens(text) {
+  let nonCjk = 0;
+  let cjk = 0;
+  for (const char of text) {
+    if (isCjkChar(char)) cjk += 1;
+    else nonCjk += 1;
+  }
+  return (nonCjk * 3 + cjk * 6) / 10;
+}
+
 /** Count the non-whitespace tokens of a text under {@link tokenize}. */
 export function countTokens(text) {
   let count = 0;
@@ -89,13 +125,14 @@ export function countTokens(text) {
 
 /**
  * Size one emitted entry the way every budget in this module is enforced:
- * the token count, floored at the real-density `chars / 4` equivalent so the
- * total checkpoint cap also sees pathological unbroken token runs.
+ * the VCC word-class token count, floored at the DeepSeek-doc character
+ * density equivalent (0.3 token per non-CJK char, 0.6 per CJK char) so the
+ * total checkpoint cap also sees pathological long runs.
  * @param text - entry text.
  * @returns the budget-relevant size in tokens.
  */
 export function estimateEntryTokens(text) {
-  return Math.max(countTokens(text), Math.ceil(text.length / 4));
+  return Math.max(countTokens(text), Math.ceil(estimateDeepSeekTokens(text)));
 }
 
 /**
@@ -277,6 +314,23 @@ export const DEFAULT_ARG_TOOLS = Object.freeze([
   "ralph",
   "workflow"
 ]);
+
+/**
+ * First-line projection for a tool-call one-liner: multiline arguments
+ * collapse to the first physical line plus a `[+ N lines]` marker, so
+ * scripted commands (bash heredocs, multi-line pipelines) stay one compact
+ * line instead of echoing the whole payload.
+ * @param value - the key-argument string.
+ * @returns the display value.
+ */
+export function oneLineArg(value) {
+  const lines = value.split(/\r?\n/u);
+  if (lines.length === 1) return value;
+  const first = lines[0] !== "" || lines.every((line) => line.trim() === "")
+    ? lines[0]
+    : lines.find((line) => line.trim() !== "");
+  return `${first} [+ ${lines.length - 1} lines]`;
+}
 
 /**
  * Pick the key argument for a tool-call one-liner: the tool-specific field
@@ -524,7 +578,7 @@ export function compileNodes(nodes, config, budgets) {
           if (argTools.includes(name)) {
             const parsed = parseToolArguments(block.arguments);
             const arg = pickToolKeyArg(name, parsed, keyFields);
-            oneLine = arg === undefined ? `* ${name}` : `* ${name} "${arg}"`;
+            oneLine = arg === undefined ? `* ${name}` : `* ${name} "${oneLineArg(arg)}"`;
             diag = `whitelist=yes argsType=${typeof block.arguments} argsLen=${block.arguments === null || block.arguments === undefined ? 0 : String(block.arguments).length} argsHead=${JSON.stringify(String(block.arguments).slice(0, 60))} parse=${parsed === null ? "FAIL" : "ok"} key=${keyFields[name] ?? "(fallback)"} arg=${arg === undefined ? "(none)" : JSON.stringify(String(arg).slice(0, 60))}`;
           } else {
             oneLine = `* ${name}`;
@@ -772,16 +826,21 @@ export function joinCompiledEntries(entries) {
 /**
  * Frame compiled entries as the durable replacement checkpoint content:
  * the shared preamble, the recall guide, then one tagged block (guide first,
- * then the optional header line, then the entries). Prior-checkpoint text
- * copied verbatim (with its own backend's tags) nests inside harmlessly.
+ * then the optional intro line, the optional header line, the entries, and
+ * the optional retention footer). Prior-checkpoint text copied verbatim
+ * (with its own backend's tags) nests inside harmlessly.
  * @param entries - ordered entry texts (strings or `{ seq, text }` pairs).
  * @param headerLine - optional first line summarizing the compiled region.
+ * @param introLine - optional first line summarizing the compaction itself.
+ * @param footerLine - optional tail line reporting the verbatim retention.
  * @returns plain text content blocks.
  */
-export function frameCheckpoint(entries, headerLine) {
+export function frameCheckpoint(entries, headerLine, introLine, footerLine) {
   const body = [RECALL_GUIDE];
+  if (introLine !== undefined) body.push(introLine);
   if (headerLine !== undefined) body.push(headerLine);
   body.push(...entries);
+  if (footerLine !== undefined) body.push(footerLine);
   return [
     { type: "text", text: `${CHECKPOINT_PREAMBLE}\n\n${CHECKPOINT_OPEN_TAG}` },
     { type: "text", text: joinCompiledEntries(body) },

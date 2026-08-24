@@ -24,10 +24,10 @@ import { assertNoActiveCompaction, compactSurfaceRegion, selectCompactableRange 
 
 /** Default request-pressure fraction for every routed model. */
 const DEFAULT_THRESHOLD_RATIO = 0.5;
-/** Default verbatim-tail fraction for every routed model. */
-const DEFAULT_RETAIN_RATIO = 0.05;
-/** Default verbatim-tail fraction retained by a manual `/compact`. */
-const DEFAULT_MANUAL_RETAIN_RATIO = 0.05;
+/** Default number of complete recent turns kept verbatim. */
+const DEFAULT_RETAIN_TURNS = 1;
+/** Default retained-region token ceiling (never exceeded by turn extension). */
+const DEFAULT_RETAIN_TOKENS = 5120;
 /** Default total cap for one compiled checkpoint, in compiler tokens. */
 const DEFAULT_MAX_TOKENS = 8192;
 /** Default scaled-cap fraction of the shadowed token count. */
@@ -46,7 +46,7 @@ const COMPILER_MODEL = "vcc-compiler";
 /** Fields shared by top-level defaults and exact-target overrides. */
 const POLICY_CONFIG_KEYS = [
   "thresholdRatio",
-  "retainRatio",
+  "retainTurns",
   "retainTokens",
   // Accepted for drop-in configuration compatibility with compaction-basic;
   // the instant backend never routes a model, so these are inert.
@@ -71,10 +71,8 @@ const COMPILER_CONFIG_KEYS = [
   "debug",
   "debugLogPath"
 ];
-/** Manual-compaction retention keys (top-level only; not per-target). */
+/** Remaining checkpoint-cap keys (top-level only). `checkpointScale` is deprecated-inert. */
 const MANUAL_CONFIG_KEYS = [
-  "manualRetainRatio",
-  "manualRetainTokens",
   "checkpointScale",
   "checkpointCap"
 ];
@@ -113,7 +111,9 @@ function pickSettingsFields(config) {
   return {
     ...config.checkpointCap !== undefined ? { checkpointCap: config.checkpointCap } : {},
     ...config.auto !== undefined ? { auto: config.auto } : {},
-    ...config.thresholdRatio !== undefined ? { thresholdRatio: config.thresholdRatio } : {}
+    ...config.thresholdRatio !== undefined ? { thresholdRatio: config.thresholdRatio } : {},
+    ...config.retainTurns !== undefined ? { retainTurns: config.retainTurns } : {},
+    ...config.retainTokens !== undefined ? { retainTokens: config.retainTokens } : {}
   };
 }
 
@@ -127,17 +127,15 @@ export function resolveConfig(config = {}) {
   validatePolicy(config, "InstantCompactionConfig");
   if (config.auto !== undefined && typeof config.auto !== "boolean") throw new Error("InstantCompactionConfig: auto must be a boolean");
   const thresholdRatio = config.thresholdRatio ?? DEFAULT_THRESHOLD_RATIO;
-  const retention = resolveRetention(config, { retainRatio: DEFAULT_RETAIN_RATIO });
-  validateRatioRetention(thresholdRatio, retention, "InstantCompactionConfig");
+  const retainTurns = config.retainTurns ?? DEFAULT_RETAIN_TURNS;
+  const retainTokens = config.retainTokens ?? DEFAULT_RETAIN_TOKENS;
   const modelPolicies = resolveModelPolicies(config.modelPolicies);
-  for (const [index, policy] of modelPolicies.entries()) validateRatioRetention(policy.thresholdRatio ?? thresholdRatio, resolveRetention(policy, retention), `InstantCompactionConfig: modelPolicies[${index}]`);
   const debug = config.debug === true || (typeof process !== "undefined" && process.env?.DSH_COMPACTION_DEBUG === "1");
   const debugLogPath = config.debugLogPath ?? (typeof process !== "undefined" && process.env?.DSH_HOME ? `${process.env.DSH_HOME}/compaction-debug.log` : "/tmp/dsh-compaction-debug.log");
   return deepFreeze({
     thresholdRatio,
-    ...retention,
-    manualRetainRatio: config.manualRetainRatio ?? DEFAULT_MANUAL_RETAIN_RATIO,
-    manualRetainTokens: config.manualRetainTokens,
+    retainTurns,
+    retainTokens,
     maxTokens: config.maxTokens ?? DEFAULT_MAX_TOKENS,
     checkpointScale: config.checkpointScale ?? DEFAULT_CHECKPOINT_SCALE,
     checkpointCap: config.checkpointCap ?? DEFAULT_CHECKPOINT_CAP,
@@ -170,19 +168,6 @@ export function resolveConfig(config = {}) {
 }
 
 /**
- * Resolve the verbatim tail a manual compaction keeps outside the compiled
- * span, so `/compact` never discards the recent conversation. An exact token
- * budget wins; otherwise the ratio applies to the measured surface total.
- * @param config - resolved validated configuration.
- * @param measurement - current token-meter measurement of the session.
- * @returns the tail budget in tokens (may be 0 for a full compaction).
- */
-export function resolveManualRetainTokens(config, measurement) {
-  if (config.manualRetainTokens !== undefined) return config.manualRetainTokens;
-  return Math.floor(measurement.totalTokens * config.manualRetainRatio);
-}
-
-/**
  * Merge the exact provider/model override over the validated default policy.
  * @param config - validated service defaults and override table.
  * @param target - exact durable provider/model route to match.
@@ -190,14 +175,14 @@ export function resolveManualRetainTokens(config, measurement) {
  */
 export function resolveTargetPolicy(config, target) {
   const override = config.modelPolicies.find((policy) => policy.provider === target.provider && policy.model === target.model);
-  const inheritedRetention = config.retainTokens === undefined ? { retainRatio: config.retainRatio } : { retainTokens: config.retainTokens };
   return deepFreeze({
     target: {
       provider: target.provider,
       model: target.model
     },
     thresholdRatio: override?.thresholdRatio ?? config.thresholdRatio,
-    ...resolveRetention(override ?? {}, inheritedRetention),
+    retainTurns: override?.retainTurns ?? config.retainTurns,
+    retainTokens: override?.retainTokens ?? config.retainTokens,
     summarizationProvider: override?.summarizationProvider ?? config.summarizationProvider ?? "",
     summarizationModel: override?.summarizationModel ?? config.summarizationModel ?? "",
     maxTokens: override?.maxTokens ?? config.maxTokens,
@@ -216,30 +201,17 @@ export function resolveCompactSpec(policy, contextWindow) {
   const targetKey = `${policy.target.provider}/${policy.target.model}`;
   if (!Number.isInteger(contextWindow) || contextWindow <= 0) throw new TargetPressureConfigError(targetKey, `InstantCompactionConfig: contextWindow (${contextWindow}) must be a positive integer`);
   const thresholdTokens = Math.floor(contextWindow * policy.thresholdRatio);
-  const retainTokens = policy.retainTokens === undefined ? Math.floor(contextWindow * policy.retainRatio) : policy.retainTokens;
-  if (retainTokens >= thresholdTokens) throw new TargetPressureConfigError(targetKey, `InstantCompactionConfig: ${policy.target.provider}/${policy.target.model} retainTokens (${retainTokens}) must be less than threshold tokens ${thresholdTokens}`);
   return deepFreeze({
     target: { ...policy.target },
     contextWindow,
     thresholdRatio: policy.thresholdRatio,
     thresholdTokens,
-    retainTokens,
+    retainTurns: policy.retainTurns,
+    retainTokens: policy.retainTokens,
     maxTokens: policy.maxTokens,
     compactionRetries: policy.compactionRetries,
     maxOverflowRetries: policy.maxOverflowRetries
   });
-}
-
-/** Choose an explicit retention form or inherit the already-resolved fallback. */
-function resolveRetention(config, fallback) {
-  if (config.retainTokens !== undefined) return { retainTokens: config.retainTokens };
-  if (config.retainRatio !== undefined) return { retainRatio: config.retainRatio };
-  return fallback;
-}
-
-/** Reject a capacity-independent retention conflict at plugin load. */
-function validateRatioRetention(thresholdRatio, retention, name) {
-  if (retention.retainRatio !== undefined && retention.retainRatio >= thresholdRatio) throw new Error(`${name}: retainRatio (${retention.retainRatio}) must be less than the resolved thresholdRatio (${thresholdRatio})`);
 }
 
 /** Validate, detach, and reject duplicate exact-target policies. */
@@ -268,20 +240,18 @@ function assertModelPolicy(source, name) {
 /** Validate the fields common to defaults and exact-target partial overrides. */
 function validatePolicy(config, name) {
   const thresholdRatio = config.thresholdRatio;
-  const retainRatio = config.retainRatio;
+  const retainTurns = config.retainTurns;
   const retainTokens = config.retainTokens;
   const maxTokens = config.maxTokens;
   const compactionRetries = config.compactionRetries;
   const maxOverflowRetries = config.maxOverflowRetries;
   if (thresholdRatio !== undefined) assertRatio(`${name}.thresholdRatio`, thresholdRatio);
-  if (retainRatio !== undefined) assertRatio(`${name}.retainRatio`, retainRatio);
+  if (retainTurns !== undefined) assertPositiveInteger(`${name}.retainTurns`, retainTurns);
   if (retainTokens !== undefined) assertNonNegativeInteger(`${name}.retainTokens`, retainTokens);
-  if (retainRatio !== undefined && retainTokens !== undefined) throw new Error(`${name}: retainRatio and retainTokens are mutually exclusive`);
   if (maxTokens !== undefined) assertPositiveInteger(`${name}.maxTokens`, maxTokens);
   if (compactionRetries !== undefined) assertNonNegativeInteger(`${name}.compactionRetries`, compactionRetries);
   if (maxOverflowRetries !== undefined) assertNonNegativeInteger(`${name}.maxOverflowRetries`, maxOverflowRetries);
   validateSummarizationPair(config, name);
-  validateManualRetention(config, name);
   if (config.checkpointScale !== undefined) assertRatio(`${name}.checkpointScale`, config.checkpointScale);
   if (config.checkpointCap !== undefined) assertPositiveInteger(`${name}.checkpointCap`, config.checkpointCap);
   for (const key of ["textTokens", "userTextTokens", "toolCallTokens", "toolResultExcerptTokens"]) {
@@ -312,15 +282,6 @@ function resolveToolNameList(configured, fallback, key) {
     throw new Error(`InstantCompactionConfig: ${key} must be an array of non-empty strings`);
   }
   return [...new Set(configured)];
-}
-
-/** Validate the manual-compaction verbatim-tail retention pair. */
-function validateManualRetention(config, name) {
-  const ratio = config.manualRetainRatio;
-  const tokens = config.manualRetainTokens;
-  if (ratio !== undefined) assertRatio(`${name}.manualRetainRatio`, ratio);
-  if (tokens !== undefined) assertNonNegativeInteger(`${name}.manualRetainTokens`, tokens);
-  if (ratio !== undefined && tokens !== undefined) throw new Error(`${name}: manualRetainRatio and manualRetainTokens are mutually exclusive`);
 }
 
 /** Validate the optional tool-name → preferred-argument-field map. */
@@ -382,10 +343,8 @@ export function routedTarget(session) {
 }
 
 const thresholdRatioSchema = z.number();
-const retainRatioSchema = z.number();
+const retainTurnsSchema = z.number().step(1).min(1);
 const retainTokensSchema = z.number().step(1).min(0);
-const manualRetainRatioSchema = z.number();
-const manualRetainTokensSchema = z.number().step(1).min(0);
 const checkpointScaleSchema = z.number();
 const checkpointCapSchema = z.number().step(1).min(1);
 const summarizationProviderSchema = z.string();
@@ -397,7 +356,7 @@ const modelPolicy = z.object({
   provider: z.string().required(),
   model: z.string().required(),
   thresholdRatio: thresholdRatioSchema,
-  retainRatio: retainRatioSchema,
+  retainTurns: retainTurnsSchema,
   retainTokens: retainTokensSchema,
   summarizationProvider: summarizationProviderSchema,
   summarizationModel: summarizationModelSchema,
@@ -444,10 +403,8 @@ export class InstantCompactionEngine extends CompactionEngine {
   ];
   static Config = z.object({
     thresholdRatio: thresholdRatioSchema,
-    retainRatio: retainRatioSchema,
+    retainTurns: retainTurnsSchema,
     retainTokens: retainTokensSchema,
-    manualRetainRatio: manualRetainRatioSchema,
-    manualRetainTokens: manualRetainTokensSchema,
     checkpointScale: checkpointScaleSchema,
     checkpointCap: checkpointCapSchema,
     summarizationProvider: summarizationProviderSchema,
@@ -481,7 +438,9 @@ export class InstantCompactionEngine extends CompactionEngine {
   static SETTINGS_SCHEMA = z.object({
     checkpointCap: z.number().step(1).min(1).default(DEFAULT_CHECKPOINT_CAP),
     auto: z.boolean().default(true),
-    thresholdRatio: z.number().min(0).max(1).default(DEFAULT_THRESHOLD_RATIO)
+    thresholdRatio: z.number().min(0).max(1).default(DEFAULT_THRESHOLD_RATIO),
+    retainTurns: z.number().step(1).min(1).default(DEFAULT_RETAIN_TURNS),
+    retainTokens: z.number().step(1).min(0).default(DEFAULT_RETAIN_TOKENS)
   });
   /** Resolved and validated compaction configuration. */
   config;
@@ -703,7 +662,7 @@ export class InstantCompactionEngine extends CompactionEngine {
         prune.pruneSession(agent.session);
         measurement = meter.measure(agent.session);
       }
-      const range = selectCompactableRange(agent.session, measurement, 0);
+      const range = selectCompactableRange(agent.session, measurement, 1, 0);
       if (range === null) return null;
       return this.compactRegion(range.start, range.end, agent, signal);
     }
@@ -720,7 +679,7 @@ export class InstantCompactionEngine extends CompactionEngine {
     if (measurement.totalTokens < spec.thresholdTokens) return null;
     let result = null;
     for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
-      const range = selectCompactableRange(agent.session, measurement, spec.retainTokens);
+      const range = selectCompactableRange(agent.session, measurement, spec.retainTurns, spec.retainTokens);
       if (range === null) {
         /* v8 ignore else -- concrete replacement preserves a compactable checkpoint; subclass hooks cannot mutate it. */
         if (result === null) return null;
@@ -764,8 +723,7 @@ export class InstantCompactionEngine extends CompactionEngine {
         try {
           operationSignal.throwIfAborted();
           const measurement = this.ctx.tokenMeter.measure(agent.session);
-          const retainTokens = resolveManualRetainTokens(this.config, measurement);
-          const range = selectCompactableRange(agent.session, measurement, retainTokens);
+          const range = selectCompactableRange(agent.session, measurement, this.config.retainTurns, this.config.retainTokens);
           if (range === null) return null;
           return await compactSurfaceRegion(this.regionDependencies(), agent.session, range.start, range.end, agent, {
             owner: null,

@@ -6,14 +6,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync, rmSync } from "node:fs";
 import { compileNoisePatterns, DEFAULT_ARG_TOOLS, DEFAULT_NOISE_PATTERNS } from "../src/compiler.js";
-import { resolveCompactSpec, resolveConfig, resolveManualRetainTokens, resolveTargetPolicy, TargetPressureConfigError } from "../src/index.js";
+import { resolveCompactSpec, resolveConfig, resolveTargetPolicy, TargetPressureConfigError } from "../src/index.js";
 
 test("resolveConfig applies the documented defaults", () => {
   const config = resolveConfig({});
   assert.equal(config.thresholdRatio, 0.5);
-  assert.equal(config.retainRatio, 0.05);
-  assert.equal(config.manualRetainRatio, 0.05);
-  assert.equal(config.manualRetainTokens, undefined);
+  assert.equal(config.retainTurns, 1);
+  assert.equal(config.retainTokens, 5120);
   assert.equal(config.maxTokens, 8192);
   assert.equal(config.checkpointScale, 0.1);
   assert.equal(config.checkpointCap, 65536);
@@ -30,13 +29,18 @@ test("resolveConfig applies the documented defaults", () => {
 
 test("resolveConfig rejects unknown keys", () => {
   assert.throws(() => resolveConfig({ textToken: 1 }), /unknown key "textToken"/);
+  assert.throws(() => resolveConfig({ retainRatio: 0.05 }), /unknown key "retainRatio"/);
+  assert.throws(() => resolveConfig({ manualRetainRatio: 0.05 }), /unknown key "manualRetainRatio"/);
+  assert.throws(() => resolveConfig({ manualRetainTokens: 100 }), /unknown key "manualRetainTokens"/);
 });
 
-test("resolveConfig validates ratio and retention conflicts", () => {
-  assert.throws(() => resolveConfig({ retainRatio: 0.9, thresholdRatio: 0.8 }), /retainRatio/);
-  assert.throws(() => resolveConfig({ retainRatio: 0.2, retainTokens: 100 }), /mutually exclusive/);
+test("resolveConfig validates ratios, term retention, and threshold", () => {
   assert.throws(() => resolveConfig({ thresholdRatio: 0 }), /thresholdRatio/);
   assert.throws(() => resolveConfig({ thresholdRatio: 1.5 }), /thresholdRatio/);
+  assert.throws(() => resolveConfig({ retainTurns: 0 }), /retainTurns/);
+  assert.throws(() => resolveConfig({ retainTurns: 1.5 }), /retainTurns/);
+  assert.throws(() => resolveConfig({ retainTokens: -1 }), /retainTokens/);
+  assert.throws(() => resolveConfig({ retainTokens: 1.5 }), /retainTokens/);
 });
 
 test("resolveConfig validates compiler budgets and flags", () => {
@@ -86,24 +90,17 @@ test("resolveConfig debug defaults off and installs a file sink when on", () => 
   rmSync("/tmp/dsh-compaction-debug-test.log", { force: true });
 });
 
-test("resolveConfig validates manual retention and scaled-cap keys", () => {
-  assert.throws(() => resolveConfig({ manualRetainRatio: 0 }), /manualRetainRatio/);
-  assert.throws(() => resolveConfig({ manualRetainRatio: 1.5 }), /manualRetainRatio/);
-  assert.throws(() => resolveConfig({ manualRetainTokens: -1 }), /manualRetainTokens/);
-  assert.throws(() => resolveConfig({ manualRetainRatio: 0.2, manualRetainTokens: 100 }), /mutually exclusive/);
+test("resolveConfig validates retained-term budgets", () => {
+  assert.throws(() => resolveConfig({ retainTurns: 0 }), /retainTurns/);
+  assert.equal(resolveConfig({ retainTurns: 3 }).retainTurns, 3);
+  assert.equal(resolveConfig({ retainTokens: 50000 }).retainTokens, 50000);
   assert.throws(() => resolveConfig({ checkpointScale: 0 }), /checkpointScale/);
   assert.throws(() => resolveConfig({ checkpointCap: 0 }), /checkpointCap/);
-  const config = resolveConfig({ manualRetainTokens: 500, checkpointScale: 0.25, checkpointCap: 32768 });
-  assert.equal(config.manualRetainTokens, 500);
+  const config = resolveConfig({ retainTurns: 2, retainTokens: 3000, checkpointScale: 0.25, checkpointCap: 32768 });
+  assert.equal(config.retainTurns, 2);
+  assert.equal(config.retainTokens, 3000);
   assert.equal(config.checkpointScale, 0.25);
   assert.equal(config.checkpointCap, 32768);
-});
-
-test("resolveManualRetainTokens prefers the exact budget over the ratio", () => {
-  const ratio = resolveConfig({ manualRetainRatio: 0.2 });
-  assert.equal(resolveManualRetainTokens(ratio, { totalTokens: 1000 }), 200);
-  const exact = resolveConfig({ manualRetainTokens: 150 });
-  assert.equal(resolveManualRetainTokens(exact, { totalTokens: 1000 }), 150);
 });
 
 test("resolveConfig validates the inert summarization pair for drop-in parity", () => {
@@ -114,7 +111,7 @@ test("resolveConfig validates the inert summarization pair for drop-in parity", 
 
 test("resolveConfig validates modelPolicies and rejects duplicates", () => {
   assert.throws(() => resolveConfig({ modelPolicies: [{ provider: "p" }] }), /modelPolicies\[0\]/);
-  assert.throws(() => resolveConfig({ modelPolicies: [{ provider: "p", model: "m", retainRatio: 0.9 }] }), /modelPolicies\[0\].*retainRatio/);
+  assert.throws(() => resolveConfig({ modelPolicies: [{ provider: "p", model: "m", retainRatio: 0.9 }] }), /modelPolicies\[0\].*unknown key "retainRatio"/);
   assert.throws(() => resolveConfig({
     modelPolicies: [
       { provider: "p", model: "m" },
@@ -124,24 +121,29 @@ test("resolveConfig validates modelPolicies and rejects duplicates", () => {
 });
 
 test("resolveTargetPolicy overlays exact-target fields over defaults", () => {
-  const config = resolveConfig({ retainRatio: 0.2 });
+  const config = resolveConfig({ retainTurns: 2, retainTokens: 3000 });
   const policy = resolveTargetPolicy(config, { provider: "p", model: "m" });
   assert.equal(policy.thresholdRatio, 0.5);
-  assert.equal(policy.retainRatio, 0.2);
+  assert.equal(policy.retainTurns, 2);
+  assert.equal(policy.retainTokens, 3000);
   const overridden = resolveConfig({
-    modelPolicies: [{ provider: "p", model: "m", thresholdRatio: 0.9, retainTokens: 500 }]
+    modelPolicies: [{ provider: "p", model: "m", thresholdRatio: 0.9, retainTurns: 5, retainTokens: 9000 }]
   });
   const targeted = resolveTargetPolicy(overridden, { provider: "p", model: "m" });
   assert.equal(targeted.thresholdRatio, 0.9);
-  assert.equal(targeted.retainTokens, 500);
+  assert.equal(targeted.retainTurns, 5);
+  assert.equal(targeted.retainTokens, 9000);
 });
 
 test("resolveCompactSpec scales budgets and rejects invalid windows", () => {
   const policy = resolveTargetPolicy(resolveConfig({}), { provider: "p", model: "m" });
   const spec = resolveCompactSpec(policy, 1000);
   assert.equal(spec.thresholdTokens, 500);
-  assert.equal(spec.retainTokens, 50);
+  assert.equal(spec.retainTurns, 1);
+  assert.equal(spec.retainTokens, 5120);
   assert.throws(() => resolveCompactSpec(policy, 0), TargetPressureConfigError);
-  const conflicting = resolveTargetPolicy(resolveConfig({ retainTokens: 900 }), { provider: "p", model: "m" });
-  assert.throws(() => resolveCompactSpec(conflicting, 1000), /retainTokens.*must be less than threshold/);
+  const configured = resolveTargetPolicy(resolveConfig({ retainTurns: 2, retainTokens: 4000 }), { provider: "p", model: "m" });
+  const scaled = resolveCompactSpec(configured, 1000);
+  assert.equal(scaled.retainTurns, 2);
+  assert.equal(scaled.retainTokens, 4000);
 });
