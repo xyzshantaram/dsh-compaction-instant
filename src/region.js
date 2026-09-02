@@ -19,7 +19,7 @@ import { CompactionId, ManualCompactionError, compactCheckpointSource, toolPairi
 import { createUserMessage, errorChain } from "@deepseek-ai/dsh-llm";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { frameCheckpoint, joinCompiledEntries } from "./compiler.js";
+import { frameCheckpoint, isCheckpointSource, joinCompiledEntries } from "./compiler.js";
 
 /**
  * Rejects a compiled checkpoint whose replacement boundaries are no longer
@@ -33,6 +33,26 @@ export class SurfaceChangedError extends Error {}
  * replaces. Each attempt compiles under a tighter cap.
  */
 const MAX_COMPILE_ATTEMPTS = 3;
+
+/** Share of a span a checkpoint may still occupy on a non-final attempt. */
+const MIN_SHRINK_RATIO = 0.75;
+
+/**
+ * True lowest and highest seq of a shadowed set. Surface order stops matching
+ * seq order once a checkpoint replaces an earlier span, so the first and last
+ * surface node of a span do not bound its seqs.
+ * @param seqs - shadowed surface seqs in surface order.
+ * @returns the inclusive seq bounds.
+ */
+function seqBounds(seqs) {
+  let minSeq = seqs[0];
+  let maxSeq = seqs[0];
+  for (const seq of seqs) {
+    if (seq < minSeq) minSeq = seq;
+    if (seq > maxSeq) maxSeq = seq;
+  }
+  return { minSeq, maxSeq };
+}
 
 /**
  * Turn index of every surface node, read from the log's `turn/start` events.
@@ -141,11 +161,22 @@ export function selectCompactableRange(session, measurement, retainTurns, retain
   }
   if (keepFromIdx === 0) return null;
   let spanTokens = 0;
-  for (let index = 0; index < keepFromIdx; index += 1) spanTokens += pricedNodes[index].tokens;
+  let checkpointTokens = 0;
+  for (let index = 0; index < keepFromIdx; index += 1) {
+    const priced = pricedNodes[index];
+    spanTokens += priced.tokens;
+    const event = session.events[priced.seq];
+    if (event !== undefined && event.type === "user/message" && isCheckpointSource(event.data?.source)) checkpointTokens += priced.tokens;
+  }
   return {
     start: surfaceNodes[0],
     end: surfaceNodes[keepFromIdx - 1],
-    spanTokens
+    spanTokens,
+    // Tokens the span holds that no checkpoint has compacted yet. Selection
+    // always starts at the surface head, which is the previous checkpoint once
+    // one has landed, so this is the only figure that says whether replacing
+    // the span can free anything.
+    newTokens: spanTokens - checkpointTokens
   };
 }
 
@@ -330,7 +361,8 @@ async function compileCompaction(dependencies, prepared, agent, compactionId, so
     // expansion as one tidy code block even when messages contain markdown.
     const verb = sourceCommandId === undefined ? "Automatic compaction" : "Manual /compact";
     const introLine = `${verb}: compiled ${prepared.shadowedSeqs.length} nodes / ~${prepared.shadowedTokenCount} tokens into ${compiled.entries.length} entries / ~${compiled.stats.tokens} tokens`;
-    const headerLine = `## Compiled checkpoint: ${prepared.shadowedSeqs.length} nodes (seqs ${prepared.start}-${prepared.end}, ~${prepared.shadowedTokenCount} tokens) — ${compiled.entries.length} entries, ~${compiled.stats.tokens} tokens compiled`;
+    const bounds = seqBounds(prepared.shadowedSeqs);
+    const headerLine = `## Compiled checkpoint: ${prepared.shadowedSeqs.length} nodes (seqs ${bounds.minSeq}-${bounds.maxSeq}, ~${prepared.shadowedTokenCount} tokens) — ${compiled.entries.length} entries, ~${compiled.stats.tokens} tokens compiled`;
     // Verbatim retention footer: nodes after the compiled span were never
     // compiled, so they stay in the live surface as original text.
     const retainedNodes = prepared.measurement.nodes.slice(prepared.endIdx + 1);
@@ -349,7 +381,14 @@ async function compileCompaction(dependencies, prepared, agent, compactionId, so
       source: compactCheckpointSource(compactionId, sourceCommandId)
     });
     framedTokenCount = dependencies.meter.estimateMessage(checkpointMessage);
-    if (framedTokenCount < prepared.shadowedTokenCount) return {
+    // Earlier attempts demand a material reduction, because a checkpoint that
+    // frees a handful of tokens leaves pressure high and is compacted again at
+    // once. The final attempt keeps the plain any-shrink rule so a stubborn but
+    // legitimate span still lands instead of failing the step.
+    const shrinkCeiling = attempt === MAX_COMPILE_ATTEMPTS - 1
+      ? prepared.shadowedTokenCount
+      : Math.floor(prepared.shadowedTokenCount * MIN_SHRINK_RATIO);
+    if (framedTokenCount < shrinkCeiling) return {
       ...prepared,
       summary,
       provider: compiled.provider,
@@ -405,8 +444,12 @@ function commitCompactionBody(session, startEvent, compiled) {
     ...startEvent.data.sourceCommandId === undefined ? {} : { sourceCommandId: startEvent.data.sourceCommandId },
     summary,
     shadowedRange: {
+      // `start`/`end` are surface positions, so `start` may hold a higher seq
+      // than `end` once a checkpoint sits at the head. `minSeq`/`maxSeq` carry
+      // the true seq bounds of the shadowed set.
       start,
-      end
+      end,
+      ...seqBounds(shadowedSeqs)
     },
     shadowedSeqs: [...shadowedSeqs],
     shadowedTokenCount,
@@ -432,8 +475,12 @@ function commitCompactionBody(session, startEvent, compiled) {
     summarySeq: summaryEvent.seq,
     summary,
     shadowedRange: {
+      // `start`/`end` are surface positions, so `start` may hold a higher seq
+      // than `end` once a checkpoint sits at the head. `minSeq`/`maxSeq` carry
+      // the true seq bounds of the shadowed set.
       start,
-      end
+      end,
+      ...seqBounds(shadowedSeqs)
     },
     shadowedSeqs: [...shadowedSeqs],
     shadowedTokenCount

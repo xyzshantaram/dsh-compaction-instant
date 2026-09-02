@@ -41,6 +41,15 @@ const MIN_CHECKPOINT_TOKENS = 128;
  * compacting it would grow the surface. Such a span is left alone.
  */
 const MIN_COMPACTABLE_SPAN_TOKENS = 1024;
+
+/**
+ * Least not-yet-compacted tokens an automatic pressure span must hold.
+ * Selection always starts at the surface head, and after the first compaction
+ * that head is the previous checkpoint, so a span can look large while holding
+ * almost no new material. Rewriting that span frees close to nothing and leaves
+ * pressure high, so compaction fires again at once and consumes its own output.
+ */
+const MIN_NEW_SPAN_TOKENS = 4096;
 /** Default total cap for one compiled checkpoint, in compiler tokens. */
 const DEFAULT_MAX_TOKENS = 8192;
 /** Default scaled-cap fraction of the shadowed token count. */
@@ -361,10 +370,17 @@ export function routedTarget(session) {
  * tags), so a span below that floor can only grow the surface. Selection stays
  * a pure geometric choice; this is the policy that reads it.
  * @param range - selected range, or `null` when nothing is compactable.
- * @returns true when the span pays for its own framing.
+ * @param trigger - what asked for the compaction.
+ * @returns true when the span is worth replacing under that trigger.
  */
-export function isWorthCompacting(range) {
-  return range !== null && range.spanTokens >= MIN_COMPACTABLE_SPAN_TOKENS;
+export function isWorthCompacting(range, trigger = "pressure") {
+  if (range === null) return false;
+  // Only automatic pressure compaction may decline a span for holding too
+  // little new material. Overflow recovery and an explicit manual compaction
+  // must still be able to force one reduction, so they ask only that the span
+  // pay for its own framing.
+  if (trigger !== "pressure") return range.spanTokens >= MIN_COMPACTABLE_SPAN_TOKENS;
+  return (range.newTokens ?? range.spanTokens) >= MIN_NEW_SPAN_TOKENS;
 }
 
 const thresholdRatioSchema = z.number();
@@ -693,7 +709,7 @@ export class InstantCompactionEngine extends CompactionEngine {
         measurement = meter.measure(agent.session);
       }
       const range = selectCompactableRange(agent.session, measurement, 1, 0);
-      if (!isWorthCompacting(range)) return null;
+      if (!isWorthCompacting(range, "context-overflow")) return null;
       return this.compactRegion(range.start, range.end, agent, signal);
     }
     const context = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)).context;
@@ -710,7 +726,7 @@ export class InstantCompactionEngine extends CompactionEngine {
     let result = null;
     for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
       const range = selectCompactableRange(agent.session, measurement, spec.retainTurns, spec.retainTokens);
-      if (!isWorthCompacting(range)) {
+      if (!isWorthCompacting(range, "pressure")) {
         /* v8 ignore else -- concrete replacement preserves a compactable checkpoint; subclass hooks cannot mutate it. */
         if (result === null) return null;
         /* v8 ignore next -- paired with the defensive post-success branch above. */
@@ -754,7 +770,7 @@ export class InstantCompactionEngine extends CompactionEngine {
           operationSignal.throwIfAborted();
           const measurement = this.ctx.tokenMeter.measure(agent.session);
           const range = selectCompactableRange(agent.session, measurement, this.config.retainTurns, this.config.retainTokens);
-          if (!isWorthCompacting(range)) return null;
+          if (!isWorthCompacting(range, "manual")) return null;
           return await compactSurfaceRegion(this.regionDependencies(), agent.session, range.start, range.end, agent, {
             owner: null,
             stability: "selected-span",

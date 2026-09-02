@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   DEFAULT_NOISE_PATTERNS,
+  RECALL_GUIDE,
   compileNoisePatterns,
   compileNodes,
   compileRegion,
@@ -23,7 +24,8 @@ import {
   sanitize,
   stripNoiseXml,
   tokenize,
-  truncateTokens
+  truncateTokens,
+  unframeCheckpointText
 } from "../src/compiler.js";
 
 const CONFIG = {
@@ -377,4 +379,62 @@ test("joinCompiledEntries keeps tool runs compact and separates groups", () => {
   // Strings behave like text entries.
   assert.equal(joinCompiledEntries(["guide", "header", "a", "b"]), "guide\n\nheader\n\na\n\nb");
   assert.equal(joinCompiledEntries([]), "");
+});
+
+test("unframeCheckpointText recovers a framed checkpoint body without its envelope", () => {
+  const blocks = frameCheckpoint(
+    [{ seq: 1, text: "[user]\nhello", kind: "text" }],
+    "## header line",
+    "intro line",
+    "footer line"
+  );
+  const text = unframeCheckpointText(blocks);
+  // The envelope, the preamble and the recall guide are framing, not content.
+  assert.doesNotMatch(text, /<compacted-checkpoint>/);
+  assert.doesNotMatch(text, /<\/compacted-checkpoint>/);
+  assert.equal(text.startsWith(RECALL_GUIDE), false);
+  // Everything the checkpoint actually carried survives.
+  assert.match(text, /intro line/);
+  assert.match(text, /## header line/);
+  assert.match(text, /\[user\]\nhello/);
+  assert.match(text, /footer line/);
+});
+
+test("unframeCheckpointText falls back to the plain projection for foreign framing", () => {
+  // A checkpoint written by another backend does not carry our three-block
+  // shape, so it is absorbed exactly as before rather than being mangled.
+  const content = [{ type: "text", text: "another backend's checkpoint" }];
+  assert.equal(unframeCheckpointText(content), projectToolResultText(content));
+});
+
+test("compiling a span that holds a prior checkpoint does not nest envelopes", () => {
+  // Regression: the compiler copied a prior checkpoint verbatim, so every
+  // generation wrapped the last one in a fresh envelope and another copy of the
+  // recall guide. A live session reached five stacked envelopes, and each
+  // checkpoint grew while the span it replaced shrank.
+  let content = frameCheckpoint(
+    [{ seq: 1, text: "[user]\noriginal request", kind: "text" }],
+    "## header 1",
+    "intro 1",
+    undefined
+  );
+  for (let generation = 2; generation <= 5; generation += 1) {
+    const nodes = [{
+      seq: generation,
+      message: {
+        role: "user",
+        content,
+        source: { kind: "plugin", plugin: "compact", compactionId: `gen-${generation}` }
+      }
+    }];
+    const { entries, stats } = compileRegion(nodes, CONFIG);
+    assert.equal(stats.checkpoints, 1);
+    content = frameCheckpoint(entries, `## header ${generation}`, `intro ${generation}`, undefined);
+  }
+  const joined = content.map((block) => block.text).join("\n");
+  assert.equal(joined.split("<compacted-checkpoint>").length - 1, 1);
+  assert.equal(joined.split("</compacted-checkpoint>").length - 1, 1);
+  assert.equal(joined.split(RECALL_GUIDE).length - 1, 1);
+  // Collapsing the generations never loses the oldest content.
+  assert.match(joined, /original request/);
 });

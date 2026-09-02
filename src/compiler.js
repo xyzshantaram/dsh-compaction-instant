@@ -393,6 +393,37 @@ export function isCheckpointSource(source) {
 }
 
 /**
+ * Drop a leading recall guide from checkpoint body text.
+ * @param text - checkpoint body text.
+ * @returns the text without its leading guide paragraph.
+ */
+function stripRecallGuide(text) {
+  if (!text.startsWith(RECALL_GUIDE)) return text;
+  return text.slice(RECALL_GUIDE.length).replace(/^\n+/, "");
+}
+
+/**
+ * Recover the inner body of a landed checkpoint, without its own framing.
+ *
+ * `frameCheckpoint` emits exactly three text blocks: the preamble joined to the
+ * open tag, the joined body, then the close tag. Re-ingesting all three nests
+ * the old checkpoint inside the new one, so every generation adds an envelope
+ * and one more copy of the recall guide, and the replacement grows instead of
+ * shrinking. Absorbing the body alone keeps one envelope and one guide however
+ * many generations collapse together.
+ * @param content - content blocks of the checkpoint message.
+ * @returns the inner body text, or the plain projection for foreign framing.
+ */
+export function unframeCheckpointText(content) {
+  const blocks = content.filter((block) => block.type === "text");
+  const framed = blocks.length === 3
+    && typeof blocks[0].text === "string" && blocks[0].text.endsWith(CHECKPOINT_OPEN_TAG)
+    && blocks[2].text === CHECKPOINT_CLOSE_TAG;
+  if (!framed) return projectToolResultText(content);
+  return stripRecallGuide(sanitize(blocks[1].text ?? ""));
+}
+
+/**
  * Head/tail excerpt of a tool result under one shared token budget. The tail
  * is anchored to the end of the text at character granularity, so a result
  * whose tail matters more than its head (file listings, logs) keeps its end.
@@ -624,7 +655,7 @@ export function compileNodes(nodes, config, budgets) {
       }
       if (isCheckpointSource(message.source)) {
         stats.checkpoints += 1;
-        const text = projectToolResultText(message.content);
+        const text = unframeCheckpointText(message.content);
         if (text.length > 0) {
           // The checkpoint node is a user/message in the durable protocol
           // (surface replacement only allows message nodes), but it is
@@ -827,8 +858,8 @@ export function joinCompiledEntries(entries) {
  * Frame compiled entries as the durable replacement checkpoint content:
  * the shared preamble, the recall guide, then one tagged block (guide first,
  * then the optional intro line, the optional header line, the entries, and
- * the optional retention footer). Prior-checkpoint text copied verbatim
- * (with its own backend's tags) nests inside harmlessly.
+ * the optional retention footer). A prior checkpoint absorbed into this span
+ * is unframed first (see `unframeCheckpointText`), so envelopes never nest.
  * @param entries - ordered entry texts (strings or `{ seq, text }` pairs).
  * @param headerLine - optional first line summarizing the compiled region.
  * @param introLine - optional first line summarizing the compaction itself.

@@ -151,11 +151,31 @@ test("resolveCompactSpec scales budgets and rejects invalid windows", () => {
 test("isWorthCompacting rejects a span that cannot pay for the checkpoint framing", () => {
   // Every checkpoint carries a fixed framing cost, so a short span can only
   // grow the surface. The engine declines it instead of compiling, failing the
-  // shrink gate, and repeating that on every step.
+  // shrink gate, and repeating that on every step. Overflow recovery and an
+  // explicit manual compaction must still be able to force one reduction, so
+  // the framing floor is the only bar they have to clear.
+  for (const trigger of ["context-overflow", "manual"]) {
+    assert.equal(isWorthCompacting(null, trigger), false);
+    assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 0 }, trigger), false);
+    assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 287 }, trigger), false);
+    assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 1023 }, trigger), false);
+    assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 1024 }, trigger), true);
+    assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 6336 }, trigger), true);
+  }
+});
+
+test("automatic pressure compaction declines a span holding too little new material", () => {
+  // Regression: selection starts at the surface head, which is the previous
+  // checkpoint once one has landed. A span that is almost all checkpoint frees
+  // close to nothing, so pressure stays above the threshold and compaction runs
+  // again at once. One live session compacted its own previous checkpoint and
+  // nothing else, freeing about 535 tokens on a 1924-token span.
   assert.equal(isWorthCompacting(null), false);
-  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 0 }), false);
-  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 287 }), false);
-  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 1023 }), false);
-  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 1024 }), true);
-  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 6336 }), true);
+  // Large span, but nearly all of it is the checkpoint being rewritten.
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 60000, newTokens: 1924 }), false);
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 8000, newTokens: 4095 }), false);
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 8000, newTokens: 4096 }), true);
+  // A range from a custom selector that omits the field falls back to the total.
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 4095 }), false);
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 4096 }), true);
 });

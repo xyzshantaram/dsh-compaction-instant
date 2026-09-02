@@ -174,7 +174,7 @@ test("compactSurfaceRegion runs a complete manual transaction with a flush", asy
   assert.equal(flushed, 1);
   assert.deepEqual(result.shadowedSeqs, [1, 2, 3, 4]);
   assert.equal(result.shadowedTokenCount, 400);
-  assert.deepEqual(result.shadowedRange, { start: 1, end: 4 });
+  assert.deepEqual(result.shadowedRange, { start: 1, end: 4, minSeq: 1, maxSeq: 4 });
   // The UI-facing summary is the compiled body in one adaptive code fence,
   // opened by a compaction intro line and closed by the retention footer.
   const summaryText = result.summary[0].text;
@@ -193,7 +193,7 @@ test("compactSurfaceRegion runs a complete manual transaction with a flush", asy
   assert.equal(summaryEvent.data.provider, "test-provider");
   assert.equal(summaryEvent.data.model, "test-compiler");
   assert.deepEqual(summaryEvent.data.shadowedSeqs, [1, 2, 3, 4]);
-  assert.deepEqual(summaryEvent.data.shadowedRange, { start: 1, end: 4 });
+  assert.deepEqual(summaryEvent.data.shadowedRange, { start: 1, end: 4, minSeq: 1, maxSeq: 4 });
   const checkpoint = events[result.summarySeq + 1];
   assert.equal(checkpoint.type, "user/message");
   assert.equal(checkpoint.data.source.plugin, "compact");
@@ -304,4 +304,75 @@ test("selectCompactableRange returns spanTokens for the priced nodes inside the 
   const twoNodes = selectCompactableRange(session, measurement, 2, 0);
   assert.deepEqual([twoNodes.start, twoNodes.end], [1, 2]);
   assert.equal(twoNodes.spanTokens, 200);
+});
+
+test("selectCompactableRange reports the span's not-yet-compacted tokens", () => {
+  // Selection always starts at the surface head, and once a checkpoint lands
+  // that head is the checkpoint itself. `newTokens` is what tells the policy
+  // whether replacing the span can free anything.
+  const checkpoint = createUserMessage({
+    content: [{ type: "text", text: "prior checkpoint" }],
+    source: { kind: "plugin", plugin: "compact", compactionId: "x" }
+  });
+  const asked = createUserMessage({ content: [{ type: "text", text: "hello" }], source: { kind: "user" } });
+  const replied = createAssistantMessage({
+    content: [{ type: "text", text: "hi" }],
+    source: { provider: "p", model: "m" }
+  });
+  const seed = [
+    { type: "turn/start", seq: 0, time: 1, data: { turn: 1 } },
+    { type: "user/message", seq: 1, time: 2, data: checkpoint, surfaceOp: "append" },
+    { type: "user/message", seq: 2, time: 3, data: asked, surfaceOp: "append" },
+    { type: "assistant/message", seq: 3, time: 4, data: { message: replied }, surfaceOp: "append" },
+    { type: "turn/end", seq: 4, time: 5, data: { turn: 1 } },
+    { type: "turn/start", seq: 5, time: 6, data: { turn: 2 } },
+    { type: "user/message", seq: 6, time: 7, data: asked, surfaceOp: "append" },
+    { type: "assistant/message", seq: 7, time: 8, data: { message: replied }, surfaceOp: "append" },
+    { type: "turn/end", seq: 8, time: 9, data: { turn: 2 } }
+  ];
+  const session = Session.create("session-new-tokens", seed);
+  const range = selectCompactableRange(session, makeFakeMeter().measure(session), 1, 0);
+  // Turn 1 is compactable and turn 2 is retained: three nodes at 100 each.
+  assert.deepEqual([range.start, range.end], [1, 3]);
+  assert.equal(range.spanTokens, 300);
+  // One of those three nodes is a landed checkpoint, so only 200 are new.
+  assert.equal(range.newTokens, 200);
+});
+
+test("the shrink gate demands a material cut before it settles for any cut", async () => {
+  // Regression: the gate accepted a checkpoint one token smaller than the span
+  // it replaced. That freed nothing, left pressure above the threshold, and
+  // triggered compaction again at once. Early attempts now require a real cut.
+  // The final attempt keeps the old any-shrink rule so a stubborn span still
+  // lands rather than failing the step.
+  const run = async (framedTokens) => {
+    const session = makeIdleSession();
+    const meter = makeFakeMeter();
+    meter.estimateMessage = () => framedTokens;
+    let compiles = 0;
+    const countingCompile = async () => {
+      compiles += 1;
+      return {
+        entries: [{ seq: 1, text: "[user]\ncompiled body" }],
+        stats: { tokens: 3 },
+        capped: false,
+        provider: "test-provider",
+        model: "test-compiler"
+      };
+    };
+    const result = await compactSurfaceRegion({ meter, compile: countingCompile }, session, 1, 4, undefined, {
+      owner: null,
+      stability: "selected-span",
+      flush: async () => {}
+    }, undefined);
+    return { compiles, result };
+  };
+  // The span prices at 400 tokens, so a material cut must reach 300 or less.
+  const clean = await run(250);
+  assert.equal(clean.compiles, 1);
+  assert.equal(clean.result.shadowedTokenCount, 400);
+  // 350 is a real but immaterial cut: it is refused until the final attempt.
+  const marginal = await run(350);
+  assert.equal(marginal.compiles, 3);
+  assert.equal(marginal.result.shadowedTokenCount, 400);
 });
