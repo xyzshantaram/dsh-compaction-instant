@@ -15,8 +15,8 @@
 import z from "@deepseek-ai/schemastery";
 import { appendFileSync } from "node:fs";
 import { CompactionEngine, ManualCompactionError } from "@deepseek-ai/dsh-compaction";
-import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
-import { CONTEXT_WINDOW_EXCEEDED_CODE, assertNever, deepFreeze } from "@deepseek-ai/dsh-llm";
+import { CONTEXT_WINDOW_EXCEEDED_CODE } from "@deepseek-ai/dsh-llm";
+import { assertNever, deepFreeze } from "@deepseek-ai/dsh-util-values";
 import { compileNoisePatterns, compileRegion, COMPILER_REV, DEFAULT_ARG_TOOLS, DEFAULT_NOISE_PATTERNS, isCheckpointSource } from "./compiler.js";
 import { assertNoActiveCompaction, compactSurfaceRegion, selectCompactableRange } from "./region.js";
 
@@ -428,7 +428,7 @@ export class InstantCompactionEngine extends CompactionEngine {
     debugLogPath: z.string()
   });
   /** Settings namespace for user-owned instant-compaction preferences. */
-  static SETTINGS_NAMESPACE = settingsNamespace("compaction-instant");
+  static SETTINGS_NAMESPACE = "compaction-instant";
   /**
    * Settings-exposed subset of the engine configuration. Defaults mirror the
    * engine's own `DEFAULT_*` constants so the resolved settings layer is
@@ -479,21 +479,31 @@ export class InstantCompactionEngine extends CompactionEngine {
    */
   _installSettingsSection(ctx) {
     const entry = this.entry;
-    installSettingsSection(ctx, InstantCompactionEngine.SETTINGS_NAMESPACE, InstantCompactionEngine.SETTINGS_SCHEMA, pickSettingsFields(entry), {
-      validate: (value) => {
-        // Full validation over the entry with the settings layer applied:
-        // settings values are only accepted when the merged config is sound.
-        resolveConfig({ ...entry, ...value });
-      },
-      setSource: (next) => {
-        // The settings layer resolves only the exposed subset, so non-exposed
-        // entry fields (modelPolicies, toolArgTools, ...) must survive the
-        // swap; merge them under the settings layer.
-        this.source = () => ({ ...entry, ...next() });
-      },
-      onChange: () => {
+    const base = pickSettingsFields(entry);
+    // dsh 0.1.2 removed installSettingsSection/settingsNamespace. Register
+    // through ctx.settings when the service exists; otherwise keep the
+    // composition entry as the config source.
+    ctx.inject(["settings"], (scoped) => {
+      const scope = scoped.settings.register(
+        InstantCompactionEngine.SETTINGS_NAMESPACE,
+        InstantCompactionEngine.SETTINGS_SCHEMA,
+        {
+          base,
+          validate: (value) => {
+            resolveConfig({ ...entry, ...value });
+          },
+        },
+      );
+      this.source = () => ({ ...entry, ...scope.get() });
+      scoped.effect(() => () => {
+        this.source = () => entry;
         this._reloadConfig();
-      }
+      });
+      this._reloadConfig();
+      scope.watch(() => {
+        this.source = () => ({ ...entry, ...scope.get() });
+        this._reloadConfig();
+      });
     });
   }
   /** Register or dispose the automatic-compaction listeners with the `auto` flag. */
