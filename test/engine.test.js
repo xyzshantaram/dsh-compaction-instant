@@ -107,16 +107,17 @@ test("compile() aborts on a cancelled signal", async () => {
   );
 });
 
-test("compile() caps the checkpoint at checkpointCap", async () => {
+test("compile() caps the checkpoint at the smaller of checkpointCap and a span fraction", async () => {
   const session = makeIdleSession();
   const ctx = new Context();
   ctx.provide("tokenMeter", {
     measure: () => ({ nodes: [] }),
     estimateMessage: () => 10
   });
-  // The total budget for one checkpoint is exactly `checkpointCap` — no
-  // proportional scaling, no floor — so a small span compiles near-losslessly
-  // under the cap and a huge span elides down to it.
+  // The total budget for one checkpoint is `checkpointCap`, bounded by a
+  // fraction of the span being replaced. A cap above the span would let the
+  // compiler elide nothing, and the fixed framing cost would then make the
+  // replacement larger than its source.
   const engine = new InstantCompactionEngine(ctx, {
     auto: false,
     checkpointCap: 4096,
@@ -143,12 +144,16 @@ test("compile() caps the checkpoint at checkpointCap", async () => {
     selectedNodes: [],
     shadowedTokenCount: 2000
   };
-  // The budget is the cap regardless of the shadowed span size.
-  assert.equal(engine.effectiveMaxTokens(2000), 4096);
+  // A small span binds on its own size, a huge span binds on the cap.
+  assert.equal(engine.effectiveMaxTokens(2000), 1200);
   assert.equal(engine.effectiveMaxTokens(1_000_000), 4096);
+  // Each retry halves the target again, down to the floor.
+  assert.equal(engine.effectiveMaxTokens(2000, 1), 600);
+  assert.equal(engine.effectiveMaxTokens(2000, 2), 300);
+  assert.equal(engine.effectiveMaxTokens(10), 128);
   const result = await engine.compile(prepared, undefined, undefined);
-  // 2000 priced tokens fit under the 4096 cap, so the long user text survives
-  // untruncated.
+  // The compiled body stays well under the 1200-token budget, so the long
+  // user text survives untruncated.
   const text = result.entries.map((entry) => entry.text).join("\n");
   assert.match(text, /word word word/);
   assert.ok(text.length > 400, `long text survived (${text.length} chars)`);
@@ -189,9 +194,9 @@ test("engine regionDependencies drive a real manual transaction end-to-end", asy
   assert.equal(checkpoint.data.source.plugin, "compact");
   const text = checkpoint.data.content.map((block) => block.text).join("\n");
   assert.match(text, /<compacted-checkpoint>/);
-  assert.match(text, /自动压缩: 将 4 个节点 \/ ~400 tokens 编译为 \d+ 条目 \/ ~\d+ tokens/);
+  assert.match(text, /Automatic compaction: compiled 4 nodes \/ ~400 tokens into \d+ entries \/ ~\d+ tokens/);
   assert.match(text, /## Compiled checkpoint: 4 nodes \(seqs 1-4/);
-  assert.match(text, /尾部原文保留: 1 节点 \/ ~100 tokens/);
+  assert.match(text, /Verbatim tail retained: 1 nodes \/ ~100 tokens/);
   assert.match(text, /RECALL: /);
   assert.match(text, /recall/);
   assert.match(text, /search/);
@@ -201,3 +206,79 @@ test("engine regionDependencies drive a real manual transaction end-to-end", asy
 });
 
 
+
+test("compactSurfaceRegion commits a plain-prose checkpoint smaller than the content it replaces", async () => {
+  // Build one detached session: one complete turn holding 30 alternating
+  // user and assistant prose messages. No tool calls, so the compiler has no
+  // cheap rows to drop.
+  const sentence = (index) => {
+    const topics = [
+      "The release plan lists the migration steps in order.",
+      "The review found one open question about the retry policy.",
+      "The team recorded the outage window in the shared calendar.",
+      "The new cache layer removes the repeated database reads.",
+      "The billing report now reconciles against the ledger each night."
+    ];
+    return `${topics[index % topics.length]} Entry ${index} notes the follow-up owner, the target date, and the confirmation that the change passed review.`;
+  };
+  const messages = [];
+  for (let index = 0; index < 30; index += 1) {
+    const text = sentence(index);
+    messages.push(index % 2 === 0
+      ? createUserMessage({ content: [{ type: "text", text }], source: { kind: "user" } })
+      : createAssistantMessage({ content: [{ type: "text", text }], source: { provider: "p", model: "m" } }));
+  }
+  const seed = [{ type: "turn/start", seq: 0, time: 1, data: { turn: 1 } }];
+  let seq = 1;
+  for (const message of messages) {
+    const type = message.role === "user" ? "user/message" : "assistant/message";
+    const data = message.role === "user" ? message : { message };
+    seed.push({ type, seq, time: seq + 1, data, surfaceOp: "append" });
+    seq += 1;
+  }
+  seed.push({ type: "turn/end", seq, time: seq + 1, data: { turn: 1 } });
+  const session = Session.create("session-prose", seed);
+
+  // Honest meter: ceil(text.length / 4) per text block, applied to both
+  // estimateMessage and the per-node surface pricing.
+  const estimate = (message) => message.content.reduce(
+    (total, block) => block.type === "text" ? total + Math.ceil(block.text.length / 4) : total,
+    0
+  );
+  const meter = {
+    estimateMessage: estimate,
+    measure: (target) => {
+      const nodes = target.surface.nodes.map((nodeSeq) => ({
+        seq: nodeSeq,
+        tokens: estimate(target.deriveEventMessage(target.events[nodeSeq]))
+      }));
+      return {
+        logRevision: 0,
+        baseline: { kind: "none", tokens: 0 },
+        surfaceDeltaTokens: 0,
+        totalTokens: nodes.reduce((total, node) => total + node.tokens, 0),
+        surfaceTokens: nodes.reduce((total, node) => total + node.tokens, 0),
+        nodes
+      };
+    }
+  };
+
+  const ctx = new Context();
+  ctx.provide("tokenMeter", meter);
+  const engine = new InstantCompactionEngine(ctx, { auto: false });
+
+  const nodes = session.surface.nodes;
+  const firstSeq = nodes[0];
+  const endSeq = nodes[nodes.length - 3]; // keep the last two nodes; every cut is balanced here
+  const tokensBefore = meter.measure(session).totalTokens;
+
+  // Must resolve. Today the engine hands the compiler a cap far above the
+  // span, the compiler compresses nothing, the framing cost lands on top, and
+  // the shrink gate rejects the checkpoint instead of committing it.
+  await compactSurfaceRegion(engine.regionDependencies(), session, firstSeq, endSeq, undefined, {
+    owner: null,
+    stability: "selected-span"
+  }, undefined);
+
+  assert.ok(meter.measure(session).totalTokens < tokensBefore);
+});

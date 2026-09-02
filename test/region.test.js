@@ -178,10 +178,10 @@ test("compactSurfaceRegion runs a complete manual transaction with a flush", asy
   // The UI-facing summary is the compiled body in one adaptive code fence,
   // opened by a compaction intro line and closed by the retention footer.
   const summaryText = result.summary[0].text;
-  assert.match(summaryText, /自动压缩: 将 4 个节点 \/ ~400 tokens 编译为 1 条目 \/ ~3 tokens/);
+  assert.match(summaryText, /Automatic compaction: compiled 4 nodes \/ ~400 tokens into 1 entries \/ ~3 tokens/);
   assert.match(summaryText, /## Compiled checkpoint: 4 nodes \(seqs 1-4, ~400 tokens\)/);
   assert.match(summaryText, /\[user\]\ncompiled body/);
-  assert.match(summaryText, /尾部原文保留: 1 节点 \/ ~100 tokens/);
+  assert.match(summaryText, /Verbatim tail retained: 1 nodes \/ ~100 tokens/);
   const events = session.events;
   const startEvent = events[result.startSeq];
   const summaryEvent = events[result.summarySeq];
@@ -276,4 +276,32 @@ test("fenceCode wraps text and adapts to embedded fences", () => {
   assert.equal(fenceCode("````"), "`````\n````\n`````");
   assert.equal(fenceCode(""), "```\n\n```");
   assert.equal(fenceCode("no backticks"), "```\nno backticks\n```");
+});
+
+test("selectCompactableRange compacts the whole surface when the ceiling is smaller than one node", () => {
+  // Regression: an oversized node. When the retained-region ceiling is smaller
+  // than every single node, no node fits in the retained tail, and the whole
+  // surface becomes compactable. The code used to walk one position past the
+  // end of the surface array here, so the tool-pairing balance check threw
+  // `tool-pairing balance: surface seq undefined not found`.
+  const session = makeMultiTurnSession();
+  const range = selectCompactableRange(session, makeFakeMeter().measure(session), 1, 50);
+  assert.equal(range.start, 1);
+  assert.equal(range.end, 12);
+});
+
+test("selectCompactableRange returns spanTokens for the priced nodes inside the range", () => {
+  // Contract: the returned object carries spanTokens, the sum of the priced
+  // tokens of every node inside the returned range. Callers need it to decide
+  // whether a span is worth compacting at all.
+  const session = makeMultiTurnSession();
+  const measurement = makeFakeMeter().measure(session);
+  // Six nodes (seqs 1-8) at 100 tokens each.
+  const sixNodes = selectCompactableRange(session, measurement, 1, 0);
+  assert.deepEqual([sixNodes.start, sixNodes.end], [1, 8]);
+  assert.equal(sixNodes.spanTokens, 600);
+  // Two nodes (seqs 1-2) at 100 tokens each.
+  const twoNodes = selectCompactableRange(session, measurement, 2, 0);
+  assert.deepEqual([twoNodes.start, twoNodes.end], [1, 2]);
+  assert.equal(twoNodes.spanTokens, 200);
 });

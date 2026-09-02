@@ -28,6 +28,19 @@ const DEFAULT_THRESHOLD_RATIO = 0.5;
 const DEFAULT_RETAIN_TURNS = 1;
 /** Default retained-region token ceiling (never exceeded by turn extension). */
 const DEFAULT_RETAIN_TOKENS = 5120;
+/**
+ * A checkpoint may never plan to spend more than this fraction of the span it
+ * replaces. Above it the compiler elides nothing and the fixed framing cost
+ * makes the replacement larger than its source.
+ */
+const CHECKPOINT_SHRINK_RATIO = 0.6;
+/** Lower bound for the compiled-body cap, in compiler tokens. */
+const MIN_CHECKPOINT_TOKENS = 128;
+/**
+ * A span smaller than this cannot pay for the fixed checkpoint framing, so
+ * compacting it would grow the surface. Such a span is left alone.
+ */
+const MIN_COMPACTABLE_SPAN_TOKENS = 1024;
 /** Default total cap for one compiled checkpoint, in compiler tokens. */
 const DEFAULT_MAX_TOKENS = 8192;
 /** Default scaled-cap fraction of the shadowed token count. */
@@ -342,6 +355,18 @@ export function routedTarget(session) {
   };
 }
 
+/**
+ * Whether one selected range is large enough to be worth replacing. Every
+ * checkpoint carries a fixed framing cost (preamble, recall guide, header,
+ * tags), so a span below that floor can only grow the surface. Selection stays
+ * a pure geometric choice; this is the policy that reads it.
+ * @param range - selected range, or `null` when nothing is compactable.
+ * @returns true when the span pays for its own framing.
+ */
+export function isWorthCompacting(range) {
+  return range !== null && range.spanTokens >= MIN_COMPACTABLE_SPAN_TOKENS;
+}
+
 const thresholdRatioSchema = z.number();
 const retainTurnsSchema = z.number().step(1).min(1);
 const retainTokensSchema = z.number().step(1).min(0);
@@ -578,16 +603,19 @@ export class InstantCompactionEngine extends CompactionEngine {
     };
   }
   /**
-   * Resolve the total cap for one compiled checkpoint: always the configured
-   * `checkpointCap` (default 65536 compiler tokens). The old proportional
-   * scaling (`checkpointScale`) and floor (`maxTokens`) were removed — a
-   * checkpoint either fits under the cap (near-lossless) or elides down to it.
-   * @param shadowedTokenCount - retained for subclass override signature
-   * parity; the cap no longer scales with the shadowed span.
+   * Resolve the total cap for one compiled checkpoint. The configured
+   * `checkpointCap` (default 65536 compiler tokens) is the ceiling, but a
+   * checkpoint may never plan to spend more than a fraction of the span it
+   * replaces: a cap above the span lets the compiler elide nothing, and the
+   * fixed checkpoint framing then makes the replacement larger than its
+   * source. Each retry halves the target again.
+   * @param shadowedTokenCount - priced token count of the span being replaced.
+   * @param attempt - zero-based compile attempt; each one tightens the cap.
    * @returns the cap in compiler tokens.
    */
-  effectiveMaxTokens(shadowedTokenCount) {
-    return this.config.checkpointCap;
+  effectiveMaxTokens(shadowedTokenCount, attempt = 0) {
+    const spanTarget = Math.floor(shadowedTokenCount * CHECKPOINT_SHRINK_RATIO / 2 ** attempt);
+    return Math.max(MIN_CHECKPOINT_TOKENS, Math.min(this.config.checkpointCap, spanTarget));
   }
   /**
    * Compile one priced region with the deterministic VCC-style compiler.
@@ -597,8 +625,9 @@ export class InstantCompactionEngine extends CompactionEngine {
    * @param agent - retained for signature parity; the default compiler never
    *   routes a model call through it.
    * @param signal - optional cancellation checked before the compile.
+   * @param attempt - zero-based compile attempt, forwarded to the cap.
    * @returns ordered checkpoint entries plus backend provenance and stats.
-   */  async compile(prepared, agent, signal) {
+   */  async compile(prepared, agent, signal, attempt = 0) {
     signal?.throwIfAborted();
     const nodes = prepared.shadowedSeqs.map((seq) => {
       const event = prepared.session.events[seq];
@@ -619,10 +648,11 @@ export class InstantCompactionEngine extends CompactionEngine {
         checkpointOrdinals.set(event.seq, checkpointCount);
       }
     }
-    engineDebug(this.config, `compile span=${prepared.shadowedSeqs.length} seqs=${prepared.shadowedSeqs[0]}-${prepared.shadowedSeqs[prepared.shadowedSeqs.length - 1]} shadowedTokens=${prepared.shadowedTokenCount} cap=${this.effectiveMaxTokens(prepared.shadowedTokenCount)} checkpoints=${checkpointCount}`);
+    const cap = this.effectiveMaxTokens(prepared.shadowedTokenCount, attempt);
+    engineDebug(this.config, `compile span=${prepared.shadowedSeqs.length} seqs=${prepared.shadowedSeqs[0]}-${prepared.shadowedSeqs[prepared.shadowedSeqs.length - 1]} shadowedTokens=${prepared.shadowedTokenCount} attempt=${attempt} cap=${cap} checkpoints=${checkpointCount}`);
     const { entries, stats, capped } = compileRegion(nodes, {
       ...this.config,
-      maxTokens: this.effectiveMaxTokens(prepared.shadowedTokenCount),
+      maxTokens: cap,
       checkpointOrdinals
     });
     engineDebug(this.config, `compile done entries=${entries.length} tokens=${stats.tokens} capped=${capped} toolCalls=${stats.toolCalls} toolResults=${stats.toolResults}`);
@@ -663,7 +693,7 @@ export class InstantCompactionEngine extends CompactionEngine {
         measurement = meter.measure(agent.session);
       }
       const range = selectCompactableRange(agent.session, measurement, 1, 0);
-      if (range === null) return null;
+      if (!isWorthCompacting(range)) return null;
       return this.compactRegion(range.start, range.end, agent, signal);
     }
     const context = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)).context;
@@ -680,7 +710,7 @@ export class InstantCompactionEngine extends CompactionEngine {
     let result = null;
     for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
       const range = selectCompactableRange(agent.session, measurement, spec.retainTurns, spec.retainTokens);
-      if (range === null) {
+      if (!isWorthCompacting(range)) {
         /* v8 ignore else -- concrete replacement preserves a compactable checkpoint; subclass hooks cannot mutate it. */
         if (result === null) return null;
         /* v8 ignore next -- paired with the defensive post-success branch above. */
@@ -724,7 +754,7 @@ export class InstantCompactionEngine extends CompactionEngine {
           operationSignal.throwIfAborted();
           const measurement = this.ctx.tokenMeter.measure(agent.session);
           const range = selectCompactableRange(agent.session, measurement, this.config.retainTurns, this.config.retainTokens);
-          if (range === null) return null;
+          if (!isWorthCompacting(range)) return null;
           return await compactSurfaceRegion(this.regionDependencies(), agent.session, range.start, range.end, agent, {
             owner: null,
             stability: "selected-span",
@@ -747,7 +777,7 @@ export class InstantCompactionEngine extends CompactionEngine {
   regionDependencies() {
     return {
       meter: this.ctx.tokenMeter,
-      compile: (prepared, owner, abort) => this.compile(prepared, owner, abort)
+      compile: (prepared, owner, abort, attempt) => this.compile(prepared, owner, abort, attempt)
     };
   }
 }

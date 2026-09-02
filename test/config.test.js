@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync, rmSync } from "node:fs";
 import { compileNoisePatterns, DEFAULT_ARG_TOOLS, DEFAULT_NOISE_PATTERNS } from "../src/compiler.js";
-import { resolveCompactSpec, resolveConfig, resolveTargetPolicy, TargetPressureConfigError } from "../src/index.js";
+import { isWorthCompacting, resolveCompactSpec, resolveConfig, resolveTargetPolicy, TargetPressureConfigError } from "../src/index.js";
 
 test("resolveConfig applies the documented defaults", () => {
   const config = resolveConfig({});
@@ -146,4 +146,16 @@ test("resolveCompactSpec scales budgets and rejects invalid windows", () => {
   const scaled = resolveCompactSpec(configured, 1000);
   assert.equal(scaled.retainTurns, 2);
   assert.equal(scaled.retainTokens, 4000);
+});
+
+test("isWorthCompacting rejects a span that cannot pay for the checkpoint framing", () => {
+  // Every checkpoint carries a fixed framing cost, so a short span can only
+  // grow the surface. The engine declines it instead of compiling, failing the
+  // shrink gate, and repeating that on every step.
+  assert.equal(isWorthCompacting(null), false);
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 0 }), false);
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 287 }), false);
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 1023 }), false);
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 1024 }), true);
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 6336 }), true);
 });

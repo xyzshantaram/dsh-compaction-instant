@@ -29,6 +29,12 @@ import { frameCheckpoint, joinCompiledEntries } from "./compiler.js";
 export class SurfaceChangedError extends Error {}
 
 /**
+ * Attempts allowed to land a checkpoint that prices smaller than the span it
+ * replaces. Each attempt compiles under a tighter cap.
+ */
+const MAX_COMPILE_ATTEMPTS = 3;
+
+/**
  * Turn index of every surface node, read from the log's `turn/start` events.
  * Nodes before the first turn boundary get turn 0; sessions with no turn
  * events at all produce an all-zero map (selection then keeps everything).
@@ -72,7 +78,8 @@ function turnStartIndex(turns, index) {
  * @param measurement - unified pressure and surface measurement from the conversation meter.
  * @param retainTurns - preferred complete recent turns kept verbatim (>= 1).
  * @param retainTokens - hard retained-region token ceiling; 0 keeps only the preferred turns.
- * @returns the inclusive positional seq range to compact, or `null`.
+ * @returns the inclusive positional seq range to compact plus its priced
+ *   `spanTokens` total, or `null`.
  */
 export function selectCompactableRange(session, measurement, retainTurns, retainTokens) {
   const pricedNodes = measurement.nodes;
@@ -121,14 +128,24 @@ export function selectCompactableRange(session, measurement, retainTurns, retain
     keepFromIdx = 0;
     while (keepFromIdx < turns.length && turns[keepFromIdx] < mandatoryTurnFloor) keepFromIdx += 1;
   }
+  // The cut index sits one past the last node when nothing fits inside the
+  // ceiling. That cut is the end of the surface, so check it as the trailing
+  // cut of the last node. Reading surfaceNodes[keepFromIdx] there would pass
+  // undefined to the balance check, which throws.
+  const cutBalanced = (index) => index >= surfaceNodes.length
+    ? toolPairingBalancedAfter(session, surfaceNodes[surfaceNodes.length - 1])
+    : toolPairingBalancedBefore(session, surfaceNodes[index]);
   while (keepFromIdx > 0) {
-    if (toolPairingBalancedBefore(session, surfaceNodes[keepFromIdx])) break;
+    if (cutBalanced(keepFromIdx)) break;
     keepFromIdx -= 1;
   }
   if (keepFromIdx === 0) return null;
+  let spanTokens = 0;
+  for (let index = 0; index < keepFromIdx; index += 1) spanTokens += pricedNodes[index].tokens;
   return {
     start: surfaceNodes[0],
-    end: surfaceNodes[keepFromIdx - 1]
+    end: surfaceNodes[keepFromIdx - 1],
+    spanTokens
   };
 }
 
@@ -290,6 +307,11 @@ export function prepareCompaction(dependencies, session, selection) {
  * Run the deterministic region compiler, frame its checkpoint, and price the
  * replacement under the singleton token meter. Mirrors basic's shrink
  * guarantee: a checkpoint that would not reduce the surface is rejected.
+ *
+ * The compiler sizes its own output with its own tokenizer, while this gate
+ * prices the framed message with the session meter. The two scales differ, so
+ * one pass can miss even when the cap looked small enough. Each retry passes a
+ * higher attempt number, which the compile hook turns into a tighter cap.
  * @param dependencies - conversation meter and the compile hook.
  * @param prepared - priced selection snapshot.
  * @param agent - retained for signature parity; the compiler never routes it.
@@ -299,41 +321,44 @@ export function prepareCompaction(dependencies, session, selection) {
  * @returns the compiled summary, provenance, and framed checkpoint message.
  */
 async function compileCompaction(dependencies, prepared, agent, compactionId, sourceCommandId, signal) {
-  const compiled = await dependencies.compile(prepared, agent, signal);
-  // The UI-facing summary IS the compiled body: the checkpoint row expands to
-  // exactly the entries the model sees. The body is joined with separators
-  // and wrapped in an adaptive Markdown fence, so the UI renders the whole
-  // expansion as one tidy code block even when messages contain markdown.
-  const verb = sourceCommandId === undefined ? "自动压缩" : "手动 /compact";
-  const introLine = `${verb}: 将 ${prepared.shadowedSeqs.length} 个节点 / ~${prepared.shadowedTokenCount} tokens 编译为 ${compiled.entries.length} 条目 / ~${compiled.stats.tokens} tokens`;
-  const headerLine = `## Compiled checkpoint: ${prepared.shadowedSeqs.length} nodes (seqs ${prepared.start}-${prepared.end}, ~${prepared.shadowedTokenCount} tokens) — ${compiled.entries.length} entries, ~${compiled.stats.tokens} tokens compiled`;
-  // Verbatim retention footer: nodes after the compiled span were never
-  // compiled, so they stay in the live surface as original text.
-  const retainedNodes = prepared.measurement.nodes.slice(prepared.endIdx + 1);
-  const retainedTokenCount = retainedNodes.reduce((total, node) => total + node.tokens, 0);
-  const footerLine = retainedNodes.length === 0 ? undefined
-    : `尾部原文保留: ${retainedNodes.length} 节点 / ~${retainedTokenCount} tokens（未被压缩,仍在对话中）`;
-  const bodyEntries = [
-    introLine,
-    headerLine,
-    ...compiled.entries,
-    ...(footerLine === undefined ? [] : [footerLine])
-  ];
-  const summary = [{ type: "text", text: fenceCode(joinCompiledEntries(bodyEntries)) }];
-  const checkpointMessage = createUserMessage({
-    content: frameCheckpoint(compiled.entries, headerLine, introLine, footerLine),
-    source: compactCheckpointSource(compactionId, sourceCommandId)
-  });
-  const framedTokenCount = dependencies.meter.estimateMessage(checkpointMessage);
-  if (framedTokenCount >= prepared.shadowedTokenCount) throw new Error(`compiled checkpoint is not smaller than the shadowed content (${framedTokenCount} estimated framed tokens >= ${prepared.shadowedTokenCount})`);
-  return {
-    ...prepared,
-    summary,
-    provider: compiled.provider,
-    model: compiled.model,
-    checkpointMessage,
-    framedTokenCount
-  };
+  let framedTokenCount = 0;
+  for (let attempt = 0; attempt < MAX_COMPILE_ATTEMPTS; attempt += 1) {
+    const compiled = await dependencies.compile(prepared, agent, signal, attempt);
+    // The UI-facing summary IS the compiled body: the checkpoint row expands to
+    // exactly the entries the model sees. The body is joined with separators
+    // and wrapped in an adaptive Markdown fence, so the UI renders the whole
+    // expansion as one tidy code block even when messages contain markdown.
+    const verb = sourceCommandId === undefined ? "Automatic compaction" : "Manual /compact";
+    const introLine = `${verb}: compiled ${prepared.shadowedSeqs.length} nodes / ~${prepared.shadowedTokenCount} tokens into ${compiled.entries.length} entries / ~${compiled.stats.tokens} tokens`;
+    const headerLine = `## Compiled checkpoint: ${prepared.shadowedSeqs.length} nodes (seqs ${prepared.start}-${prepared.end}, ~${prepared.shadowedTokenCount} tokens) — ${compiled.entries.length} entries, ~${compiled.stats.tokens} tokens compiled`;
+    // Verbatim retention footer: nodes after the compiled span were never
+    // compiled, so they stay in the live surface as original text.
+    const retainedNodes = prepared.measurement.nodes.slice(prepared.endIdx + 1);
+    const retainedTokenCount = retainedNodes.reduce((total, node) => total + node.tokens, 0);
+    const footerLine = retainedNodes.length === 0 ? undefined
+      : `Verbatim tail retained: ${retainedNodes.length} nodes / ~${retainedTokenCount} tokens (not compiled, still in the conversation)`;
+    const bodyEntries = [
+      introLine,
+      headerLine,
+      ...compiled.entries,
+      ...(footerLine === undefined ? [] : [footerLine])
+    ];
+    const summary = [{ type: "text", text: fenceCode(joinCompiledEntries(bodyEntries)) }];
+    const checkpointMessage = createUserMessage({
+      content: frameCheckpoint(compiled.entries, headerLine, introLine, footerLine),
+      source: compactCheckpointSource(compactionId, sourceCommandId)
+    });
+    framedTokenCount = dependencies.meter.estimateMessage(checkpointMessage);
+    if (framedTokenCount < prepared.shadowedTokenCount) return {
+      ...prepared,
+      summary,
+      provider: compiled.provider,
+      model: compiled.model,
+      checkpointMessage,
+      framedTokenCount
+    };
+  }
+  throw new Error(`compiled checkpoint is not smaller than the shadowed content after ${MAX_COMPILE_ATTEMPTS} attempts (${framedTokenCount} estimated framed tokens >= ${prepared.shadowedTokenCount})`);
 }
 
 /**
