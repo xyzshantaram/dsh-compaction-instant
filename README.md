@@ -50,7 +50,9 @@ All fields optional; defaults shown.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `thresholdRatio` | `0.5` | Fraction of the routed model's context window that triggers automatic compaction |
+| `thresholdRatio` | `0.5` | Fraction of the routed model's context window that triggers automatic compaction; the effective trigger is the smaller of this and `compactAtTokens` |
+| `compactAtTokens` | `250000` | Absolute surface-token trigger. Measured on the conversation surface, the only part a compaction can shrink, so it ignores the system prompt, the tool schemas, and provider cache accounting |
+| `compactToTokens` | `15000` | Surface tokens left after a compaction that fires at the trigger, applied as a ratio: a surface that overshot the trigger earns a proportionately larger budget (340000 maps to 20400) |
 | `retainTurns` | `1` | Preferred complete recent turns kept verbatim (automatic and manual `/compact`); never overrides the ceiling |
 | `retainTokens` | `5120` | **Hard** retained-region token ceiling: older whole turns are added only while the total fits, and when the latest turn alone exceeds it, only the fitting suffix of that turn is kept |
 | `auto` | `true` | Register `agent/pre-step` pressure and `agent/request-error` overflow recovery |
@@ -66,7 +68,7 @@ All fields optional; defaults shown.
 | `toolKeyFields` | built-ins | Extra tool-name → argument-field map for one-liners |
 | `toolArgTools` | see compiler | Whitelist whose key argument renders in the one-liner (`read`/`write`/`edit`/`glob`/`grep`/`bash`/`shell`/`web_search`/`skill`/`subagent`/…); every other tool is name-only |
 | `hideTools` | — | Bookkeeping tools dropped from the checkpoint entirely |
-| `modelPolicies` | — | Per provider/model overrides of `thresholdRatio`/`retainTurns`/`retainTokens` |
+| `modelPolicies` | — | Per provider/model overrides of `thresholdRatio`/`compactAtTokens`/`compactToTokens`/`retainTurns`/`retainTokens` |
 | `compactionRetries` / `maxOverflowRetries` | `1` / `1` | Retry budgets, same semantics as basic |
 | `summarizationProvider` / `summarizationModel` | — | Accepted for config drop-in compatibility; **inert** — this backend never routes a model |
 
@@ -85,6 +87,8 @@ Since 0.1.4 the engine exposes a **user-owned settings namespace** (`compaction-
 | `checkpointCap` | Total compiler-token budget for one checkpoint (default 65536) |
 | `auto` | Register automatic between-step compaction |
 | `thresholdRatio` | Context-window fraction that triggers automatic compaction (default `0.5`) |
+| `compactAtTokens` | Absolute surface-token trigger for automatic compaction (default `250000`) |
+| `compactToTokens` | Surface tokens left after a compaction at the trigger (default `15000`) |
 | `retainTurns` | Preferred complete recent turns kept verbatim (default `1`) |
 | `retainTokens` | **Hard** retained-token ceiling: whole turns (or, when the latest turn is larger, a fitting suffix of it) never exceed it (default `5120`) |
 

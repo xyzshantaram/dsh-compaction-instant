@@ -17,13 +17,35 @@ import { appendFileSync } from "node:fs";
 import { CompactionEngine, ManualCompactionError } from "@deepseek-ai/dsh-compaction";
 import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
 import { CONTEXT_WINDOW_EXCEEDED_CODE, assertNever, deepFreeze } from "@deepseek-ai/dsh-llm";
-import { compileNoisePatterns, compileRegion, COMPILER_REV, DEFAULT_ARG_TOOLS, DEFAULT_NOISE_PATTERNS, isCheckpointSource } from "./compiler.js";
+import { compileNoisePatterns, compileRegion, COMPILER_REV, DEFAULT_ARG_TOOLS, DEFAULT_NOISE_PATTERNS, estimateEntryTokens, isCheckpointSource, unframeCheckpointText } from "./compiler.js";
 import { assertNoActiveCompaction, compactSurfaceRegion, selectCompactableRange } from "./region.js";
 
 // ── configuration resolution ───────────────────────────────────────────────
 
 /** Default request-pressure fraction for every routed model. */
 const DEFAULT_THRESHOLD_RATIO = 0.5;
+/**
+ * Default absolute surface-token trigger.
+ *
+ * Compaction fires on the size of the conversation surface, because that is
+ * the only part a compaction can shrink. The token meter's request-pressure
+ * total is an anchored figure: the provider's reported usage for the last
+ * request plus the signed surface delta since then. That usage also counts the
+ * system prompt, the tool schemas, and cache read and write tokens, none of
+ * which a compaction removes. Gating on the total therefore leaves an
+ * irreducible floor that can hold a session permanently above the threshold,
+ * which makes compaction fire again at the very next step boundary and consume
+ * the checkpoint it just wrote.
+ */
+const DEFAULT_COMPACT_AT_TOKENS = 250000;
+/**
+ * Default surface-token budget remaining after a compaction that fires at the
+ * trigger. This is a ratio, not a flat size: compaction can only fire at a
+ * step boundary, so the surface may overshoot the trigger before it runs. The
+ * budget scales with the surface actually found, which keeps the promised
+ * compression constant. 250000 maps to 15000, so 340000 maps to 20400.
+ */
+const DEFAULT_COMPACT_TO_TOKENS = 15000;
 /** Default number of complete recent turns kept verbatim. */
 const DEFAULT_RETAIN_TURNS = 1;
 /** Default retained-region token ceiling (never exceeded by turn extension). */
@@ -68,6 +90,8 @@ const COMPILER_MODEL = "vcc-compiler";
 /** Fields shared by top-level defaults and exact-target overrides. */
 const POLICY_CONFIG_KEYS = [
   "thresholdRatio",
+  "compactAtTokens",
+  "compactToTokens",
   "retainTurns",
   "retainTokens",
   // Accepted for drop-in configuration compatibility with compaction-basic;
@@ -134,6 +158,8 @@ function pickSettingsFields(config) {
     ...config.checkpointCap !== undefined ? { checkpointCap: config.checkpointCap } : {},
     ...config.auto !== undefined ? { auto: config.auto } : {},
     ...config.thresholdRatio !== undefined ? { thresholdRatio: config.thresholdRatio } : {},
+    ...config.compactAtTokens !== undefined ? { compactAtTokens: config.compactAtTokens } : {},
+    ...config.compactToTokens !== undefined ? { compactToTokens: config.compactToTokens } : {},
     ...config.retainTurns !== undefined ? { retainTurns: config.retainTurns } : {},
     ...config.retainTokens !== undefined ? { retainTokens: config.retainTokens } : {}
   };
@@ -149,6 +175,8 @@ export function resolveConfig(config = {}) {
   validatePolicy(config, "InstantCompactionConfig");
   if (config.auto !== undefined && typeof config.auto !== "boolean") throw new Error("InstantCompactionConfig: auto must be a boolean");
   const thresholdRatio = config.thresholdRatio ?? DEFAULT_THRESHOLD_RATIO;
+  const compactAtTokens = config.compactAtTokens ?? DEFAULT_COMPACT_AT_TOKENS;
+  const compactToTokens = config.compactToTokens ?? DEFAULT_COMPACT_TO_TOKENS;
   const retainTurns = config.retainTurns ?? DEFAULT_RETAIN_TURNS;
   const retainTokens = config.retainTokens ?? DEFAULT_RETAIN_TOKENS;
   const modelPolicies = resolveModelPolicies(config.modelPolicies);
@@ -156,6 +184,8 @@ export function resolveConfig(config = {}) {
   const debugLogPath = config.debugLogPath ?? (typeof process !== "undefined" && process.env?.DSH_HOME ? `${process.env.DSH_HOME}/compaction-debug.log` : "/tmp/dsh-compaction-debug.log");
   return deepFreeze({
     thresholdRatio,
+    compactAtTokens,
+    compactToTokens,
     retainTurns,
     retainTokens,
     maxTokens: config.maxTokens ?? DEFAULT_MAX_TOKENS,
@@ -203,6 +233,8 @@ export function resolveTargetPolicy(config, target) {
       model: target.model
     },
     thresholdRatio: override?.thresholdRatio ?? config.thresholdRatio,
+    compactAtTokens: override?.compactAtTokens ?? config.compactAtTokens,
+    compactToTokens: override?.compactToTokens ?? config.compactToTokens,
     retainTurns: override?.retainTurns ?? config.retainTurns,
     retainTokens: override?.retainTokens ?? config.retainTokens,
     summarizationProvider: override?.summarizationProvider ?? config.summarizationProvider ?? "",
@@ -222,11 +254,16 @@ export function resolveTargetPolicy(config, target) {
 export function resolveCompactSpec(policy, contextWindow) {
   const targetKey = `${policy.target.provider}/${policy.target.model}`;
   if (!Number.isInteger(contextWindow) || contextWindow <= 0) throw new TargetPressureConfigError(targetKey, `InstantCompactionConfig: contextWindow (${contextWindow}) must be a positive integer`);
-  const thresholdTokens = Math.floor(contextWindow * policy.thresholdRatio);
+  // The absolute trigger keeps the compaction point predictable whatever model
+  // is routed. The ratio still guards a context window too small to hold it.
+  const ratioTokens = Math.floor(contextWindow * policy.thresholdRatio);
+  const thresholdTokens = Math.min(policy.compactAtTokens, ratioTokens);
   return deepFreeze({
     target: { ...policy.target },
     contextWindow,
     thresholdRatio: policy.thresholdRatio,
+    compactAtTokens: policy.compactAtTokens,
+    compactToTokens: policy.compactToTokens,
     thresholdTokens,
     retainTurns: policy.retainTurns,
     retainTokens: policy.retainTokens,
@@ -268,6 +305,8 @@ function validatePolicy(config, name) {
   const compactionRetries = config.compactionRetries;
   const maxOverflowRetries = config.maxOverflowRetries;
   if (thresholdRatio !== undefined) assertRatio(`${name}.thresholdRatio`, thresholdRatio);
+  if (config.compactAtTokens !== undefined) assertPositiveInteger(`${name}.compactAtTokens`, config.compactAtTokens);
+  if (config.compactToTokens !== undefined) assertPositiveInteger(`${name}.compactToTokens`, config.compactToTokens);
   if (retainTurns !== undefined) assertPositiveInteger(`${name}.retainTurns`, retainTurns);
   if (retainTokens !== undefined) assertNonNegativeInteger(`${name}.retainTokens`, retainTokens);
   if (maxTokens !== undefined) assertPositiveInteger(`${name}.maxTokens`, maxTokens);
@@ -380,12 +419,14 @@ export function isWorthCompacting(range, trigger = "pressure") {
   // must still be able to force one reduction, so they ask only that the span
   // pay for its own framing.
   if (trigger !== "pressure") return range.spanTokens >= MIN_COMPACTABLE_SPAN_TOKENS;
-  return (range.newTokens ?? range.spanTokens) >= MIN_NEW_SPAN_TOKENS;
+  return (range.compilableTokens ?? range.spanTokens) >= MIN_NEW_SPAN_TOKENS;
 }
 
 const thresholdRatioSchema = z.number();
 const retainTurnsSchema = z.number().step(1).min(1);
 const retainTokensSchema = z.number().step(1).min(0);
+const compactAtTokensSchema = z.number().step(1).min(1);
+const compactToTokensSchema = z.number().step(1).min(1);
 const checkpointScaleSchema = z.number();
 const checkpointCapSchema = z.number().step(1).min(1);
 const summarizationProviderSchema = z.string();
@@ -397,6 +438,8 @@ const modelPolicy = z.object({
   provider: z.string().required(),
   model: z.string().required(),
   thresholdRatio: thresholdRatioSchema,
+  compactAtTokens: compactAtTokensSchema,
+  compactToTokens: compactToTokensSchema,
   retainTurns: retainTurnsSchema,
   retainTokens: retainTokensSchema,
   summarizationProvider: summarizationProviderSchema,
@@ -444,6 +487,8 @@ export class InstantCompactionEngine extends CompactionEngine {
   ];
   static Config = z.object({
     thresholdRatio: thresholdRatioSchema,
+    compactAtTokens: compactAtTokensSchema,
+    compactToTokens: compactToTokensSchema,
     retainTurns: retainTurnsSchema,
     retainTokens: retainTokensSchema,
     checkpointScale: checkpointScaleSchema,
@@ -480,6 +525,8 @@ export class InstantCompactionEngine extends CompactionEngine {
     checkpointCap: z.number().step(1).min(1).default(DEFAULT_CHECKPOINT_CAP),
     auto: z.boolean().default(true),
     thresholdRatio: z.number().min(0).max(1).default(DEFAULT_THRESHOLD_RATIO),
+    compactAtTokens: z.number().step(1).min(1).default(DEFAULT_COMPACT_AT_TOKENS),
+    compactToTokens: z.number().step(1).min(1).default(DEFAULT_COMPACT_TO_TOKENS),
     retainTurns: z.number().step(1).min(1).default(DEFAULT_RETAIN_TURNS),
     retainTokens: z.number().step(1).min(0).default(DEFAULT_RETAIN_TOKENS)
   });
@@ -629,9 +676,28 @@ export class InstantCompactionEngine extends CompactionEngine {
    * @param attempt - zero-based compile attempt; each one tightens the cap.
    * @returns the cap in compiler tokens.
    */
-  effectiveMaxTokens(shadowedTokenCount, attempt = 0) {
-    const spanTarget = Math.floor(shadowedTokenCount * CHECKPOINT_SHRINK_RATIO / 2 ** attempt);
-    return Math.max(MIN_CHECKPOINT_TOKENS, Math.min(this.config.checkpointCap, spanTarget));
+  effectiveMaxTokens(shadowedTokenCount, attempt = 0, incomingCheckpointTokens = 0) {
+    const config = this.config;
+    // Hold the compression ratio the trigger promises. Compaction can only run
+    // at a step boundary, so the surface may overshoot the trigger before it
+    // fires; a larger surface then earns a proportionately larger checkpoint.
+    // Below the trigger the budget stays flat at compactToTokens.
+    const surfaceTokens = shadowedTokenCount + config.retainTokens;
+    const targetSurface = Math.max(config.compactToTokens, Math.floor(surfaceTokens * config.compactToTokens / config.compactAtTokens));
+    // The retained tail is verbatim, so the checkpoint gets what is left.
+    const budget = Math.max(MIN_CHECKPOINT_TOKENS, targetSurface - config.retainTokens);
+    // A checkpoint may never plan to spend more than a fraction of the span it
+    // replaces, and each retry tightens the target again.
+    const base = Math.min(budget, Math.floor(shadowedTokenCount * CHECKPOINT_SHRINK_RATIO));
+    const target = Math.floor(base / 2 ** attempt);
+    // A cap below the incoming checkpoint's own size cannot hold that
+    // checkpoint, and that is what forces the elision which destroys it. Floor
+    // the cap at what the checkpoint needs, but never above the budget. An
+    // oversized checkpoint written under an older policy is truncated with
+    // provenance by the compiler, and stays recallable from its shadowed node,
+    // rather than raising the cap for every later compaction.
+    const floor = Math.min(incomingCheckpointTokens, budget);
+    return Math.min(config.checkpointCap, Math.max(MIN_CHECKPOINT_TOKENS, target, floor));
   }
   /**
    * Compile one priced region with the deterministic VCC-style compiler.
@@ -664,7 +730,15 @@ export class InstantCompactionEngine extends CompactionEngine {
         checkpointOrdinals.set(event.seq, checkpointCount);
       }
     }
-    const cap = this.effectiveMaxTokens(prepared.shadowedTokenCount, attempt);
+    // Price the incoming checkpoint in compiler tokens, the same unit the cap
+    // is measured in, so the floor inside effectiveMaxTokens is comparable.
+    let incomingCheckpointTokens = 0;
+    for (const node of nodes) {
+      if (node.message?.role !== "user" || !isCheckpointSource(node.message.source)) continue;
+      const text = unframeCheckpointText(node.message.content);
+      if (text.length > 0) incomingCheckpointTokens += estimateEntryTokens(text);
+    }
+    const cap = this.effectiveMaxTokens(prepared.shadowedTokenCount, attempt, incomingCheckpointTokens);
     engineDebug(this.config, `compile span=${prepared.shadowedSeqs.length} seqs=${prepared.shadowedSeqs[0]}-${prepared.shadowedSeqs[prepared.shadowedSeqs.length - 1]} shadowedTokens=${prepared.shadowedTokenCount} attempt=${attempt} cap=${cap} checkpoints=${checkpointCount}`);
     const { entries, stats, capped } = compileRegion(nodes, {
       ...this.config,
@@ -717,26 +791,25 @@ export class InstantCompactionEngine extends CompactionEngine {
     const targetKey = `${target.provider}/${target.model}`;
     if (context === undefined) throw new TargetPressureConfigError(targetKey, `compaction-instant: no context capacity for ${targetKey}; configure contextWindow on that adapter model`);
     const spec = resolveCompactSpec(policy, context.contextWindow);
-    if (measurement.totalTokens < spec.thresholdTokens) return null;
+    if (measurement.surfaceTokens < spec.thresholdTokens) return null;
     if (prune !== undefined) {
       prune.pruneSession(agent.session);
       measurement = meter.measure(agent.session);
     }
-    if (measurement.totalTokens < spec.thresholdTokens) return null;
+    if (measurement.surfaceTokens < spec.thresholdTokens) return null;
     let result = null;
     for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
       const range = selectCompactableRange(agent.session, measurement, spec.retainTurns, spec.retainTokens);
-      if (!isWorthCompacting(range, "pressure")) {
-        /* v8 ignore else -- concrete replacement preserves a compactable checkpoint; subclass hooks cannot mutate it. */
-        if (result === null) return null;
-        /* v8 ignore next -- paired with the defensive post-success branch above. */
-        break;
-      }
+      if (!isWorthCompacting(range, "pressure")) break;
       result = await this.compactRegion(range.start, range.end, agent, signal);
       measurement = meter.measure(agent.session);
-      if (measurement.totalTokens < spec.thresholdTokens) return result;
+      if (measurement.surfaceTokens < spec.thresholdTokens) return result;
     }
-    throw new Error(`compaction still above threshold after ${spec.compactionRetries + 1} compaction attempts (${measurement.totalTokens} estimated tokens >= threshold ${spec.thresholdTokens})`);
+    // A landed compaction is a success even when the surface stays above the
+    // threshold. The pre-step listener reports a throw as "step compaction
+    // failed", which would misreport the checkpoint just written durably.
+    if (result !== null) engineDebug(this.config, `surface still above threshold after compaction (${measurement.surfaceTokens} >= ${spec.thresholdTokens})`);
+    return result;
   }
   /**
    * Compact one inclusive positional range from the agent-owned surface using

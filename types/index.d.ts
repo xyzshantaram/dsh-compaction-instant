@@ -30,8 +30,26 @@ export interface ModelPolicyOverride {
 
 /** Public plugin configuration, all fields optional. */
 export interface InstantCompactionConfig {
-    /** Request-pressure fraction that triggers automatic compaction. Default 0.5. */
+    /**
+     * Fraction of the routed model's context window that triggers automatic
+     * compaction. The effective trigger is the smaller of this and
+     * `compactAtTokens`. Default 0.5.
+     */
     thresholdRatio?: number;
+    /**
+     * Absolute surface-token trigger for automatic compaction. Measured on the
+     * conversation surface, which is the only part a compaction can shrink, so
+     * the trigger is unaffected by the system prompt, the tool schemas, or the
+     * provider's cache accounting. Default 250000.
+     */
+    compactAtTokens?: number;
+    /**
+     * Surface-token budget remaining after a compaction that fires at the
+     * trigger. Applied as a ratio: a surface that overshot the trigger before
+     * a step boundary let compaction run earns a proportionately larger
+     * budget. Default 15000, so 250000 maps to 15000 and 340000 to 20400.
+     */
+    compactToTokens?: number;
     /** Preferred complete recent turns kept verbatim; never overrides the ceiling. Default 1. */
     retainTurns?: number;
     /**
@@ -172,8 +190,13 @@ export declare class InstantCompactionEngine extends CompactionEngineBase {
     static Config: z<InstantCompactionConfig>;
     readonly config: ResolvedInstantCompactionConfig;
     constructor(ctx: Context, config?: InstantCompactionConfig);
-    /** Resolve the total budget for one compiled checkpoint: always `checkpointCap`. */
-    effectiveMaxTokens(shadowedTokenCount: number): number;
+    /**
+     * Resolve the total budget for one compiled checkpoint, in compiler
+     * tokens: the `compactToTokens` ratio less the retained tail, never above
+     * a fraction of the span being replaced, never above `checkpointCap`, and
+     * never below what an absorbed prior checkpoint needs to survive.
+     */
+    effectiveMaxTokens(shadowedTokenCount: number, attempt?: number, incomingCheckpointTokens?: number): number;
     /** Compile one priced region with the deterministic compiler; the sole subclass hook. */
     compile(prepared: {
         shadowedSeqs: readonly number[];

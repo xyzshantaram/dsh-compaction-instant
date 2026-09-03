@@ -718,6 +718,18 @@ const BUDGET_FLOORS = Object.freeze({
 
 /** Entry kinds dropped by the first (low-value) elision pass. */
 const LOW_VALUE_KINDS = new Set(["result", "tool", "media", "note"]);
+/**
+ * Largest share of one checkpoint's total budget a single absorbed prior
+ * checkpoint entry may occupy. A prior checkpoint written under a looser
+ * policy can be several times the current cap. Left whole it crowds out every
+ * recent entry, and the elision loop then has to drop it anyway, which loses
+ * both the history and the recent work. Truncating it keeps its head and its
+ * provenance, and the untouched original stays recallable from the shadowed
+ * node it cites.
+ */
+const CHECKPOINT_ENTRY_SHARE = 0.5;
+/** Smallest checkpoint-entry budget, in compiler tokens. */
+const MIN_CHECKPOINT_ENTRY_TOKENS = 64;
 
 /**
  * Scale ONLY the conversation-text budgets toward a total cap, never below
@@ -738,8 +750,15 @@ function scaleBudgets(budgets, factor) {
 
 /** Render the provenance range of one dropped-entry list. */
 function seqRangeOf(dropped) {
-  const first = dropped[0].seq;
-  const last = dropped[dropped.length - 1].seq;
+  // Entries are not always dropped in surface order: the checkpoint-last rule
+  // takes an ordinary entry out of the middle of the list, so the reported
+  // range must come from the true minimum and maximum seq.
+  let first = dropped[0].seq;
+  let last = dropped[0].seq;
+  for (const entry of dropped) {
+    if (entry.seq < first) first = entry.seq;
+    if (entry.seq > last) last = entry.seq;
+  }
   return first === last ? `seq ${first}` : `seqs ${first}-${last}`;
 }
 
@@ -771,6 +790,19 @@ export function compileRegion(nodes, config) {
     attempts += 1;
   }
   let capped = false;
+  // Bring an oversized absorbed checkpoint inside its share before any
+  // elision runs, so the recent conversation is not sacrificed for an entry
+  // that cannot fit whatever gets dropped for it.
+  const checkpointShare = Math.max(MIN_CHECKPOINT_ENTRY_TOKENS, Math.floor(config.maxTokens * CHECKPOINT_ENTRY_SHARE));
+  for (const entry of result.entries) {
+    if (entry.kind !== "checkpoint") continue;
+    const before = estimateEntryTokens(entry.text);
+    if (before <= checkpointShare) continue;
+    const shrunk = truncateTokens(entry.text, checkpointShare, `seq ${entry.seq}`);
+    entry.text = shrunk.text;
+    result.stats.tokens -= before - estimateEntryTokens(entry.text);
+    capped = true;
+  }
   if (result.stats.tokens > config.maxTokens) {
     const entries = result.entries;
     // Phase A: drop the oldest low-value rows (tool/result/media/note)
@@ -794,7 +826,13 @@ export function compileRegion(nodes, config) {
     const elided = [];
     const droppedCheckpoints = [];
     while (entries.length > 1 && result.stats.tokens > config.maxTokens) {
-      const dropped = entries.shift();
+      // A checkpoint entry holds the compressed history of every earlier
+      // compaction in the session, so it is the last thing sacrificed. Drop
+      // the oldest ordinary entry first, and take the oldest checkpoint only
+      // when no ordinary entry is left to drop.
+      let index = entries.findIndex((entry, position) => position < entries.length - 1 && entry.kind !== "checkpoint");
+      if (index === -1) index = 0;
+      const dropped = entries.splice(index, 1)[0];
       result.stats.tokens -= estimateEntryTokens(dropped.text);
       elided.push(dropped);
       if (dropped.kind === "checkpoint") droppedCheckpoints.push(dropped);
@@ -811,7 +849,8 @@ export function compileRegion(nodes, config) {
         const ref = ordinal === undefined ? `@ seq ${dropped.seq}` : String(ordinal);
         markerLines.push(`[checkpoint ${ref}]`);
       }
-      entries.unshift({ seq: elided[0].seq, text: markerLines.join("\n"), kind: "note" });
+      const oldestElidedSeq = elided.reduce((min, entry) => entry.seq < min ? entry.seq : min, elided[0].seq);
+      entries.unshift({ seq: oldestElidedSeq, text: markerLines.join("\n"), kind: "note" });
       result.stats.tokens += estimateEntryTokens(entries[0].text);
     }
     if (result.stats.tokens > config.maxTokens && entries.length === 1) {

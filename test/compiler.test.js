@@ -12,6 +12,7 @@ import {
   compileRegion,
   countTokens,
   estimateDeepSeekTokens,
+  estimateEntryTokens,
   excerptToolResult,
   frameCheckpoint,
   isCheckpointSource,
@@ -280,6 +281,55 @@ test("compileRegion rescales budgets and front-elides under the cap", () => {
   // The newest node always survives.
   const last = entries[entries.length - 1];
   assert.match(last.text, /payload 20/);
+});
+
+test("compileRegion elides ordinary entries before it drops a checkpoint", () => {
+  // Regression from live session a0872a7d. A checkpoint entry carries the
+  // compressed history of every earlier compaction, and selection always puts
+  // it at the head of the span. The elision loop dropped entries from the
+  // front, so the checkpoint went first: a 32653-character summary of 344606
+  // tokens was replaced by a 540-character one, two minutes after it landed.
+  const nodes = [{
+    seq: 1,
+    message: {
+      role: "user",
+      content: [{ type: "text", text: `checkpoint body ${"alpha ".repeat(120)}` }],
+      source: { kind: "plugin", plugin: "compact", compactionId: "x" }
+    }
+  }];
+  for (let seq = 2; seq <= 41; seq += 1) {
+    nodes.push({ seq, message: { role: "user", content: [{ type: "text", text: `filler ${seq} ${"word ".repeat(60)}` }], source: { kind: "user" } } });
+  }
+  for (const maxTokens of [300, 500, 800]) {
+    const { entries, capped } = compileRegion(nodes, { ...CONFIG, maxTokens });
+    assert.ok(capped, `cap ${maxTokens} enforced elision`);
+    const checkpoints = entries.filter((entry) => entry.kind === "checkpoint");
+    assert.equal(checkpoints.length, 1, `cap ${maxTokens} keeps the checkpoint entry`);
+    assert.match(checkpoints[0].text, /checkpoint body/);
+  }
+});
+
+test("compileRegion truncates an oversized checkpoint instead of dropping it", () => {
+  // Regression found by replaying the real 344606-token span of session
+  // a0872a7d. Its absorbed checkpoint was about 61626 compiler tokens against
+  // a 15863-token cap. Keeping it whole made the elision loop sacrifice every
+  // ordinary entry and then drop the checkpoint anyway: 1236 nodes compiled to
+  // 2 entries and 32 tokens. A checkpoint larger than its share is truncated,
+  // so its head survives and the recent conversation keeps the rest.
+  const nodes = [
+    { seq: 1, message: { role: "user", content: [{ type: "text", text: `first ${"alpha ".repeat(400)}` }], source: { kind: "plugin", plugin: "compact", compactionId: "x" } } }
+  ];
+  for (let seq = 2; seq <= 21; seq += 1) {
+    nodes.push({ seq, message: { role: "user", content: [{ type: "text", text: `later ${seq} ${"beta ".repeat(40)}` }], source: { kind: "user" } } });
+  }
+  const { entries, capped } = compileRegion(nodes, { ...CONFIG, maxTokens: 400 });
+  assert.ok(capped);
+  const checkpoints = entries.filter((entry) => entry.kind === "checkpoint");
+  assert.equal(checkpoints.length, 1, "the checkpoint survives, truncated");
+  assert.match(checkpoints[0].text, /truncated from seq 1/);
+  assert.ok(estimateEntryTokens(checkpoints[0].text) < 400, "the truncated checkpoint fits inside the total cap");
+  // The recent conversation is not sacrificed for it.
+  assert.ok(entries.filter((entry) => entry.kind === "text").length >= 3, "recent entries survive alongside it");
 });
 
 test("compileRegion elides tool rows before conversation text", () => {

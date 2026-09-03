@@ -308,8 +308,8 @@ test("selectCompactableRange returns spanTokens for the priced nodes inside the 
 
 test("selectCompactableRange reports the span's not-yet-compacted tokens", () => {
   // Selection always starts at the surface head, and once a checkpoint lands
-  // that head is the checkpoint itself. `newTokens` is what tells the policy
-  // whether replacing the span can free anything.
+  // that head is the checkpoint itself. `compilableTokens` is what tells the
+  // policy whether replacing the span can free anything.
   const checkpoint = createUserMessage({
     content: [{ type: "text", text: "prior checkpoint" }],
     source: { kind: "plugin", plugin: "compact", compactionId: "x" }
@@ -336,7 +336,20 @@ test("selectCompactableRange reports the span's not-yet-compacted tokens", () =>
   assert.deepEqual([range.start, range.end], [1, 3]);
   assert.equal(range.spanTokens, 300);
   // One of those three nodes is a landed checkpoint, so only 200 are new.
-  assert.equal(range.newTokens, 200);
+  assert.equal(range.compilableTokens, 200);
+});
+
+test("selectCompactableRange excludes tool results from the compilable total", () => {
+  // The compiler drops every tool result before it can occupy an entry, so a
+  // span of tool results looks large and compiles to nothing. Counting them
+  // let automatic pressure compaction accept a span that could not shrink,
+  // which is how a fresh checkpoint was consumed two minutes after it landed.
+  const session = makeMultiTurnSession();
+  const range = selectCompactableRange(session, makeFakeMeter().measure(session), 1, 0);
+  // Turns 1 and 2 compact: six nodes at 100 each, one of them a tool result.
+  assert.deepEqual([range.start, range.end], [1, 8]);
+  assert.equal(range.spanTokens, 600);
+  assert.equal(range.compilableTokens, 500);
 });
 
 test("the shrink gate demands a material cut before it settles for any cut", async () => {

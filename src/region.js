@@ -162,21 +162,27 @@ export function selectCompactableRange(session, measurement, retainTurns, retain
   if (keepFromIdx === 0) return null;
   let spanTokens = 0;
   let checkpointTokens = 0;
+  let toolResultTokens = 0;
   for (let index = 0; index < keepFromIdx; index += 1) {
     const priced = pricedNodes[index];
     spanTokens += priced.tokens;
     const event = session.events[priced.seq];
-    if (event !== undefined && event.type === "user/message" && isCheckpointSource(event.data?.source)) checkpointTokens += priced.tokens;
+    if (event === undefined) continue;
+    if (event.type === "user/message" && isCheckpointSource(event.data?.source)) checkpointTokens += priced.tokens;
+    // The compiler drops every tool result before it can occupy an entry (see
+    // the tool-result branch of the user role in compiler.js), so tool result
+    // tokens can never pay for a replacement.
+    else if (event.type === "tool/result") toolResultTokens += priced.tokens;
   }
   return {
     start: surfaceNodes[0],
     end: surfaceNodes[keepFromIdx - 1],
     spanTokens,
-    // Tokens the span holds that no checkpoint has compacted yet. Selection
-    // always starts at the surface head, which is the previous checkpoint once
-    // one has landed, so this is the only figure that says whether replacing
-    // the span can free anything.
-    newTokens: spanTokens - checkpointTokens
+    // Tokens in the span that a compaction can actually turn into something
+    // smaller. Selection always starts at the surface head, which is the
+    // previous checkpoint once one has landed, and tool results never occupy a
+    // compiled entry, so neither can pay for the replacement.
+    compilableTokens: spanTokens - checkpointTokens - toolResultTokens
   };
 }
 

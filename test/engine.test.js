@@ -107,6 +107,148 @@ test("compile() aborts on a cancelled signal", async () => {
   );
 });
 
+/**
+ * Price every surface node identically and report a request total that the
+ * caller controls, so a test can separate surface size from request pressure.
+ */
+function makeControlledMeter(perNode, totalTokens) {
+  return {
+    measure(session) {
+      const nodes = session.surface.nodes.map((seq) => ({ seq, tokens: perNode }));
+      const surfaceTokens = nodes.length * perNode;
+      return {
+        logRevision: session.events.length,
+        baseline: { kind: "usage", tokens: totalTokens ?? surfaceTokens },
+        surfaceDeltaTokens: 0,
+        totalTokens: totalTokens ?? surfaceTokens,
+        surfaceTokens,
+        nodes
+      };
+    },
+    estimateMessage: () => perNode
+  };
+}
+
+/** Build a routed session of `turns` complete turns plus one open turn. */
+function makeRoutedSession(id, turns) {
+  const seed = [{ type: "request/header", seq: 0, time: 1, data: { header: { config: { provider: "p", model: "m" } } } }];
+  let seq = 1;
+  const push = (type, data, surfaceOp) => {
+    seed.push({ type, seq, time: seq + 1, data, ...surfaceOp === undefined ? {} : { surfaceOp } });
+    seq += 1;
+  };
+  for (let turn = 1; turn <= turns; turn += 1) {
+    push("turn/start", { turn });
+    push("user/message", createUserMessage({ content: [{ type: "text", text: `ask ${turn} ${"word ".repeat(40)}` }], source: { kind: "user" } }), "append");
+    push("assistant/message", { message: createAssistantMessage({ content: [{ type: "text", text: `answer ${turn} ${"word ".repeat(40)}` }], source: { provider: "p", model: "m" } }) }, "append");
+    push("turn/end", { turn });
+  }
+  const session = Session.create(id, seed);
+  session.append("turn/start", { turn: turns + 1 });
+  return session;
+}
+
+/** Wire an engine over a controlled meter and a one-million-token window. */
+function makeEngine(perNode, totalTokens, config = {}) {
+  const ctx = new Context();
+  ctx.provide("tokenMeter", makeControlledMeter(perNode, totalTokens));
+  ctx.provide("llm", { resolveModelInfo: async () => ({ context: { contextWindow: 1_000_000 } }) });
+  return { ctx, engine: new InstantCompactionEngine(ctx, { auto: false, retainTurns: 1, retainTokens: 0, ...config }) };
+}
+
+test("automatic pressure reads the surface, not the cache-inflated request total", async () => {
+  // Regression from live session a0872a7d. The token meter reports
+  // `totalTokens` as the provider's usage for the last request plus the signed
+  // surface delta since then, and that usage sums inputTokens, outputTokens,
+  // cacheReadTokens, and cacheWriteTokens. One real request reported
+  // inputTokens 2 with cacheReadTokens 493321, so the anchor sat near 495000
+  // while the surface it described was about 350000. The difference became a
+  // fixed floor of roughly 145000 tokens that no compaction could remove, so
+  // pressure stayed above the threshold and compaction fired again at the very
+  // next step boundary, compiling away the checkpoint it had just written.
+  const { ctx, engine } = makeEngine(40000, 900000);
+  const session = makeRoutedSession("session-inflated", 2);
+  // Four surface nodes at 40000 is 160000 tokens, well under the trigger,
+  // while the reported request total is 900000.
+  const measured = ctx.tokenMeter.measure(session);
+  assert.equal(measured.surfaceTokens, 160000);
+  assert.equal(measured.totalTokens, 900000);
+  assert.equal(await engine.compactIfNeeded({ session }, "pressure", undefined), null);
+});
+
+test("automatic pressure fires once at the trigger and then stays quiet", async () => {
+  // The contract: cross 250000 surface tokens, compact exactly once, land well
+  // under the post-compaction budget, and do not run again until the surface
+  // climbs back to the trigger.
+  const { ctx, engine } = makeEngine(40000, undefined);
+  const session = makeRoutedSession("session-trigger", 5);
+  const agent = { session };
+  assert.equal(ctx.tokenMeter.measure(session).surfaceTokens, 400000);
+  const first = await engine.compactIfNeeded(agent, "pressure", undefined);
+  assert.notEqual(first, null, "crossing the trigger runs one compaction");
+  const after = ctx.tokenMeter.measure(session).surfaceTokens;
+  assert.ok(after < 250000, `the surface fell below the trigger (${after})`);
+  // Every later step boundary must decline while the surface stays small.
+  assert.equal(await engine.compactIfNeeded(agent, "pressure", undefined), null);
+  assert.equal(await engine.compactIfNeeded(agent, "pressure", undefined), null);
+});
+
+test("a landed compaction is never reported as a failure", async () => {
+  // Regression: the retry loop broke out and fell into a throw whenever the
+  // surface stayed above the threshold, and the pre-step listener logged that
+  // throw as "step compaction failed" even though the checkpoint was durably
+  // written. A compaction that landed is a success.
+  const { engine } = makeEngine(40000, undefined, { compactAtTokens: 1000, compactionRetries: 0 });
+  const session = makeRoutedSession("session-stubborn", 5);
+  const result = await engine.compactIfNeeded({ session }, "pressure", undefined);
+  assert.notEqual(result, null, "the compaction landed and is returned, not thrown");
+});
+
+test("the checkpoint budget holds the trigger's compression ratio", () => {
+  const ctx = new Context();
+  ctx.provide("tokenMeter", { measure: () => ({ nodes: [] }), estimateMessage: () => 10 });
+  // Compaction only runs at a step boundary, so the surface can overshoot the
+  // trigger before it fires. The budget scales with the surface actually
+  // found, which keeps the promised compression constant.
+  const engine = new InstantCompactionEngine(ctx, {
+    auto: false,
+    compactAtTokens: 250000,
+    compactToTokens: 15000,
+    retainTokens: 5120,
+    checkpointCap: 65536
+  });
+  // Exactly at the trigger: the whole surface must fit in 15000 tokens, and
+  // the retained tail is verbatim, so the checkpoint gets what is left.
+  assert.equal(engine.effectiveMaxTokens(244880), 9880);
+  // Overshot to 340000: 340000 / 250000 * 15000 = 20400, less the tail.
+  assert.equal(engine.effectiveMaxTokens(334880), 15280);
+  // Below the trigger the budget stays flat rather than shrinking away.
+  assert.equal(engine.effectiveMaxTokens(50000), 9880);
+});
+
+test("no compile attempt caps below the incoming checkpoint's own size", () => {
+  const ctx = new Context();
+  ctx.provide("tokenMeter", { measure: () => ({ nodes: [] }), estimateMessage: () => 10 });
+  // Regression: the cap was a fraction of the span, and a fat checkpoint at
+  // the head of a small span could not fit inside it. That is what forced the
+  // elision which then destroyed the checkpoint.
+  const engine = new InstantCompactionEngine(ctx, { auto: false, retainTokens: 5120, checkpointCap: 65536 });
+  assert.equal(engine.effectiveMaxTokens(20000, 0, 0), 9880);
+  // The retry ladder tightens the target on each attempt.
+  assert.equal(engine.effectiveMaxTokens(20000, 3, 0), 1235);
+  // No attempt caps below what the incoming checkpoint needs to survive.
+  assert.equal(engine.effectiveMaxTokens(20000, 3, 8000), 8000);
+  // The floor never breaks the post-compaction budget. A 61626-token
+  // checkpoint written under the old 65536 cap is truncated by the compiler
+  // instead of ratcheting the cap up for every later compaction.
+  assert.equal(engine.effectiveMaxTokens(20000, 0, 61626), 9880);
+  // A configured cap smaller than the checkpoint still wins.
+  const smallCtx = new Context();
+  smallCtx.provide("tokenMeter", { measure: () => ({ nodes: [] }), estimateMessage: () => 10 });
+  const capped = new InstantCompactionEngine(smallCtx, { auto: false, retainTokens: 5120, checkpointCap: 4096 });
+  assert.equal(capped.effectiveMaxTokens(20000, 0, 8000), 4096);
+});
+
 test("compile() caps the checkpoint at the smaller of checkpointCap and a span fraction", async () => {
   const session = makeIdleSession();
   const ctx = new Context();

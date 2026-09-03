@@ -148,6 +148,19 @@ test("resolveCompactSpec scales budgets and rejects invalid windows", () => {
   assert.equal(scaled.retainTokens, 4000);
 });
 
+test("resolveCompactSpec triggers on the smaller of the absolute budget and the ratio", () => {
+  // The absolute trigger keeps the compaction point predictable whatever model
+  // is routed; the ratio still guards a context window too small to hold it.
+  const config = resolveConfig({});
+  assert.equal(config.compactAtTokens, 250000);
+  assert.equal(config.compactToTokens, 15000);
+  const policy = resolveTargetPolicy(config, { provider: "p", model: "m" });
+  // A one-million-token window: the absolute budget binds.
+  assert.equal(resolveCompactSpec(policy, 1_000_000).thresholdTokens, 250000);
+  // A 128k window: half the window binds, well below the absolute budget.
+  assert.equal(resolveCompactSpec(policy, 128_000).thresholdTokens, 64000);
+});
+
 test("isWorthCompacting rejects a span that cannot pay for the checkpoint framing", () => {
   // Every checkpoint carries a fixed framing cost, so a short span can only
   // grow the surface. The engine declines it instead of compiling, failing the
@@ -172,9 +185,11 @@ test("automatic pressure compaction declines a span holding too little new mater
   // nothing else, freeing about 535 tokens on a 1924-token span.
   assert.equal(isWorthCompacting(null), false);
   // Large span, but nearly all of it is the checkpoint being rewritten.
-  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 60000, newTokens: 1924 }), false);
-  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 8000, newTokens: 4095 }), false);
-  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 8000, newTokens: 4096 }), true);
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 60000, compilableTokens: 1924 }), false);
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 8000, compilableTokens: 4095 }), false);
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 8000, compilableTokens: 4096 }), true);
+  // A span that is all tool results compiles to nothing, whatever its size.
+  assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 300000, compilableTokens: 0 }), false);
   // A range from a custom selector that omits the field falls back to the total.
   assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 4095 }), false);
   assert.equal(isWorthCompacting({ start: 1, end: 2, spanTokens: 4096 }), true);
