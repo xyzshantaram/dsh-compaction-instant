@@ -78,6 +78,12 @@ const DEFAULT_MAX_TOKENS = 8192;
 const DEFAULT_CHECKPOINT_SCALE = 0.1;
 /** Default absolute ceiling for the scaled checkpoint cap. */
 const DEFAULT_CHECKPOINT_CAP = 65536;
+/**
+ * Tools whose calls never earn a checkpoint entry by default. A todo list is
+ * pure bookkeeping: only the latest one is true, so every earlier write is
+ * superseded noise that still costs tokens to carry.
+ */
+const DEFAULT_HIDE_TOOLS = ["todo_write"];
 /** Default per-block budgets for the compiled view (compiler tokens). */
 const DEFAULT_TEXT_TOKENS = 512;
 const DEFAULT_USER_TEXT_TOKENS = 1024;
@@ -204,7 +210,7 @@ export function resolveConfig(config = {}) {
     noisePatterns: compileNoisePatterns(config.noisePatterns !== undefined && config.noisePatterns.length > 0 ? config.noisePatterns : DEFAULT_NOISE_PATTERNS),
     toolKeyFields: resolveToolKeyFields(config.toolKeyFields),
     toolArgTools: resolveToolNameList(config.toolArgTools, DEFAULT_ARG_TOOLS, "toolArgTools"),
-    hideTools: resolveToolNameList(config.hideTools, [], "hideTools"),
+    hideTools: resolveToolNameList(config.hideTools, DEFAULT_HIDE_TOOLS, "hideTools"),
     debug,
     debugLogPath,
     ...debug ? {

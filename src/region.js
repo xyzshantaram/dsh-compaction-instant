@@ -366,7 +366,15 @@ async function compileCompaction(dependencies, prepared, agent, compactionId, so
     // and wrapped in an adaptive Markdown fence, so the UI renders the whole
     // expansion as one tidy code block even when messages contain markdown.
     const verb = sourceCommandId === undefined ? "Automatic compaction" : "Manual /compact";
-    const introLine = `${verb}: compiled ${prepared.shadowedSeqs.length} nodes / ~${prepared.shadowedTokenCount} tokens into ${compiled.entries.length} entries / ~${compiled.stats.tokens} tokens`;
+    // Name what the checkpoint chose not to carry. Every dropped node stays in
+    // the durable log, so this line is the agent's pointer to go and look.
+    const dropped = [];
+    const droppedResultTokens = compiled.stats.droppedResultTokens ?? 0;
+    if (compiled.stats.toolResults > 0) dropped.push(`${compiled.stats.toolResults} tool results / ~${droppedResultTokens} tokens`);
+    if ((compiled.stats.erroredCalls ?? 0) > 0) dropped.push(`${compiled.stats.erroredCalls} errored calls`);
+    if ((compiled.stats.hiddenCalls ?? 0) > 0) dropped.push(`${compiled.stats.hiddenCalls} bookkeeping calls`);
+    const droppedLine = dropped.length === 0 ? "" : `; dropped ${dropped.join(", ")} (recall by seq)`;
+    const introLine = `${verb}: compiled ${prepared.shadowedSeqs.length} nodes / ~${prepared.shadowedTokenCount} tokens into ${compiled.entries.length} entries / ~${compiled.stats.tokens} tokens${droppedLine}`;
     const bounds = seqBounds(prepared.shadowedSeqs);
     const headerLine = `## Compiled checkpoint: ${prepared.shadowedSeqs.length} nodes (seqs ${bounds.minSeq}-${bounds.maxSeq}, ~${prepared.shadowedTokenCount} tokens) — ${compiled.entries.length} entries, ~${compiled.stats.tokens} tokens compiled`;
     // Verbatim retention footer: nodes after the compiled span were never

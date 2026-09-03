@@ -332,6 +332,29 @@ test("compileRegion truncates an oversized checkpoint instead of dropping it", (
   assert.ok(entries.filter((entry) => entry.kind === "text").length >= 3, "recent entries survive alongside it");
 });
 
+test("compileRegion drops errored calls and reports what each dropped result cost", () => {
+  // The retention policy. A failed call and its error text are noise in a
+  // checkpoint. Bookkeeping calls never earn an entry. The size of a dropped
+  // result is the only signal the agent gets about how expensive its own tool
+  // calls are, and every dropped node stays recallable from the durable log.
+  const nodes = [
+    { seq: 1, message: { role: "assistant", content: [{ type: "tool-call", id: "ok1", name: "bash", arguments: '{"command":"pnpm test"}' }] } },
+    { seq: 2, message: { role: "user", content: [{ type: "tool-result", toolCallId: "ok1", content: [{ type: "text", text: "word ".repeat(1500) }] }] } },
+    { seq: 3, message: { role: "assistant", content: [{ type: "tool-call", id: "bad1", name: "read", arguments: '{"file_path":"missing.js"}' }] } },
+    { seq: 4, message: { role: "user", content: [{ type: "tool-result", toolCallId: "bad1", isError: true, content: [{ type: "text", text: "ENOENT: no such file" }] }] } },
+    { seq: 5, message: { role: "assistant", content: [{ type: "tool-call", id: "todo1", name: "todo_write", arguments: '{"todos":[]}' }] } }
+  ];
+  const { entries, stats } = compileRegion(nodes, { ...CONFIG, hideTools: ["todo_write"], maxTokens: 4096 });
+  const text = entries.map((entry) => entry.text).join("\n");
+  assert.match(text, /bash/, "a successful call keeps its one-liner and its argument");
+  assert.doesNotMatch(text, /missing\.js/, "the errored call is dropped whole");
+  assert.doesNotMatch(text, /todo_write/, "bookkeeping calls never earn an entry");
+  assert.equal(stats.erroredCalls, 1);
+  assert.equal(stats.hiddenCalls, 1);
+  assert.ok(stats.droppedResultTokens > 1000, `dropped result size is reported (${stats.droppedResultTokens})`);
+  assert.match(text, /\[\d+\.\dk tokens dropped\]/, "the surviving call reports what its result cost");
+});
+
 test("compileRegion elides tool rows before conversation text", () => {
   const nodes = [];
   for (let seq = 1; seq <= 8; seq += 1) {

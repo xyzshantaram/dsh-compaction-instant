@@ -56,7 +56,9 @@ test("resolveConfig validates compiler budgets and flags", () => {
 test("resolveConfig validates tool whitelists and hides, and deduplicates", () => {
   assert.ok(resolveConfig({}).toolArgTools.includes("read"));
   assert.ok(resolveConfig({}).toolArgTools.includes("bash"));
-  assert.deepEqual(resolveConfig({}).hideTools, []);
+  // todo_write is bookkeeping: only the latest list is true, so earlier
+  // writes are superseded noise the checkpoint never carries.
+  assert.deepEqual(resolveConfig({}).hideTools, ["todo_write"]);
   assert.throws(() => resolveConfig({ toolArgTools: "read" }), /toolArgTools/);
   assert.throws(() => resolveConfig({ toolArgTools: [""] }), /toolArgTools/);
   assert.throws(() => resolveConfig({ hideTools: ["job_kill", 5] }), /hideTools/);
@@ -72,7 +74,7 @@ test("resolveConfig treats schemastery-injected empty arrays as unset", () => {
   const injected = { toolArgTools: [], hideTools: [], noisePatterns: [], toolKeyFields: {}, debug: true };
   const config = resolveConfig(injected);
   assert.deepEqual(config.toolArgTools, [...DEFAULT_ARG_TOOLS]);
-  assert.deepEqual(config.hideTools, []);
+  assert.deepEqual(config.hideTools, ["todo_write"]);
   assert.deepEqual(config.noisePatterns, compileNoisePatterns(DEFAULT_NOISE_PATTERNS));
 });
 

@@ -67,7 +67,7 @@ All fields optional; defaults shown.
 | `noisePatterns` | see compiler | Noise XML regex sources, applied with the `s` flag |
 | `toolKeyFields` | built-ins | Extra tool-name → argument-field map for one-liners |
 | `toolArgTools` | see compiler | Whitelist whose key argument renders in the one-liner (`read`/`write`/`edit`/`glob`/`grep`/`bash`/`shell`/`web_search`/`skill`/`subagent`/…); every other tool is name-only |
-| `hideTools` | — | Bookkeeping tools dropped from the checkpoint entirely |
+| `hideTools` | `["todo_write"]` | Bookkeeping tools dropped from the checkpoint entirely. A tool call whose result was an error is always dropped, and every surviving call line reports the size of the result it dropped |
 | `modelPolicies` | — | Per provider/model overrides of `thresholdRatio`/`compactAtTokens`/`compactToTokens`/`retainTurns`/`retainTokens` |
 | `compactionRetries` / `maxOverflowRetries` | `1` / `1` | Retry budgets, same semantics as basic |
 | `summarizationProvider` / `summarizationModel` | — | Accepted for config drop-in compatibility; **inert** — this backend never routes a model |

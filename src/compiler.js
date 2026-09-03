@@ -526,19 +526,30 @@ export function compileNodes(nodes, config, budgets) {
     noiseElided: 0,
     checkpoints: 0,
     tokens: 0,
+    // Retention reporting: what the checkpoint chose not to carry, so the
+    // intro line can tell the agent the size of what it drops and where the
+    // durable originals are.
+    droppedResultTokens: 0,
+    erroredCalls: 0,
+    hiddenCalls: 0,
     elidedToolRows: 0,
     elidedRows: 0
   };
-  // Pre-pass over the ordered nodes: map each tool-call id to the seq of its
-  // result node, so every call one-liner can carry a VCC-style result pointer
-  // (`(seq N -> result M)`) even though results no longer occupy entries.
-  const resultSeqByCallId = new Map();
+  // Pre-pass over the ordered nodes: map each tool-call id to its result node.
+  // Every call one-liner carries a VCC-style pointer (`(seq N -> result M)`)
+  // even though results never occupy entries, plus the size of the result it
+  // dropped and whether that result was an error.
+  const resultByCallId = new Map();
   for (const node of nodes) {
     const message = node.message;
     if (message === null || message === undefined || message.role !== "user" || message.content === undefined) continue;
     const first = message.content[0];
     if (first !== undefined && first.type === "tool-result" && typeof first.toolCallId === "string") {
-      resultSeqByCallId.set(first.toolCallId, node.seq);
+      resultByCallId.set(first.toolCallId, {
+        seq: node.seq,
+        tokens: estimateEntryTokens(projectToolResultText(first.content ?? [])),
+        isError: first.isError === true
+      });
     }
   }
   let lastRole;
@@ -597,7 +608,17 @@ export function compileNodes(nodes, config, budgets) {
           const name = block.name ?? "unknown";
           stats.toolCalls += 1;
           if (hiddenTools.has(name)) {
+            stats.hiddenCalls += 1;
             debugLog(config, "tool", `seq=${node.seq} name=${name} HIDDEN (hideTools)`);
+            continue;
+          }
+          const outcome = resultByCallId.get(block.id);
+          // A failed call and its error text are noise in a checkpoint. The
+          // work it guarded was either retried or abandoned, and the durable
+          // event stays one recall away either way.
+          if (outcome !== undefined && outcome.isError) {
+            stats.erroredCalls += 1;
+            debugLog(config, "tool", `seq=${node.seq} name=${name} DROPPED (errored result at seq ${outcome.seq})`);
             continue;
           }
           header = roleHeader("assistant", node.seq);
@@ -615,11 +636,16 @@ export function compileNodes(nodes, config, budgets) {
             oneLine = `* ${name}`;
             diag = `whitelist=no argsType=${typeof block.arguments} argsLen=${block.arguments === null || block.arguments === undefined ? 0 : String(block.arguments).length} argsHead=${JSON.stringify(String(block.arguments).slice(0, 60))}`;
           }
-          const resultSeq = resultSeqByCallId.get(block.id);
-          const ref = resultSeq === undefined ? seqRef(node.seq) : `${seqRef(node.seq)} -> result ${resultSeq}`;
+          const ref = outcome === undefined ? seqRef(node.seq) : `${seqRef(node.seq)} -> result ${outcome.seq}`;
+          // Report what the dropped result cost. The agent has no other way to
+          // see the size of its own tool output, and this is the signal that
+          // teaches it which calls are expensive to make.
+          const cost = outcome === undefined || outcome.tokens < DROPPED_TOKENS_NOTE_FLOOR
+            ? ""
+            : ` [${formatDroppedTokens(outcome.tokens)} dropped]`;
           const kept = truncateTokens(oneLine, effective.toolCallTokens, seqRef(node.seq));
-          debugLog(config, "tool", `seq=${node.seq} name=${name} ${diag} line=${JSON.stringify(oneLine.slice(0, 80))} truncated=${kept.truncated} ref=${ref}`);
-          pushEntry(node.seq, header + `${kept.text} (${ref})`, "tool");
+          debugLog(config, "tool", `seq=${node.seq} name=${name} ${diag} line=${JSON.stringify(oneLine.slice(0, 80))} truncated=${kept.truncated} ref=${ref} resultTokens=${outcome === undefined ? 0 : outcome.tokens}`);
+          pushEntry(node.seq, header + `${kept.text} (${ref})${cost}`, "tool");
           continue;
         }
         if (block.type === "image") {
@@ -651,6 +677,10 @@ export function compileNodes(nodes, config, budgets) {
         // into the following assistant text or one recall away via the call
         // line's `-> result N` pointer (VCC drops results from brief mode too).
         stats.toolResults += 1;
+        // The pre-pass already priced this result; only an unpaired result
+        // (no matching call in the span) needs pricing here.
+        const priced = typeof first.toolCallId === "string" ? resultByCallId.get(first.toolCallId) : undefined;
+        stats.droppedResultTokens += priced === undefined ? estimateEntryTokens(projectToolResultText(first.content ?? [])) : priced.tokens;
         continue;
       }
       if (isCheckpointSource(message.source)) {
@@ -730,6 +760,22 @@ const LOW_VALUE_KINDS = new Set(["result", "tool", "media", "note"]);
 const CHECKPOINT_ENTRY_SHARE = 0.5;
 /** Smallest checkpoint-entry budget, in compiler tokens. */
 const MIN_CHECKPOINT_ENTRY_TOKENS = 64;
+/**
+ * Smallest dropped tool-result size, in compiler tokens, that earns a size
+ * note on the surviving call line. Below this the note costs more than it
+ * tells the reader.
+ */
+const DROPPED_TOKENS_NOTE_FLOOR = 100;
+
+/**
+ * Render a dropped-result size compactly: exact below one thousand tokens,
+ * one decimal thousand above it.
+ * @param tokens - dropped result size in compiler tokens.
+ * @returns short display text.
+ */
+function formatDroppedTokens(tokens) {
+  return tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k tokens` : `${tokens} tokens`;
+}
 
 /**
  * Scale ONLY the conversation-text budgets toward a total cap, never below
