@@ -370,7 +370,13 @@ async function compileCompaction(dependencies, prepared, agent, compactionId, so
     // the durable log, so this line is the agent's pointer to go and look.
     const dropped = [];
     const droppedResultTokens = compiled.stats.droppedResultTokens ?? 0;
-    if (compiled.stats.toolResults > 0) dropped.push(`${compiled.stats.toolResults} tool results / ~${droppedResultTokens} tokens`);
+    // Name the dearest tools by dropped size, so the agent learns which of its
+    // own calls are expensive and can choose cheaper ones next time.
+    const byTool = Object.entries(compiled.stats.droppedByTool ?? {})
+      .sort((left, right) => right[1].tokens - left[1].tokens)
+      .slice(0, 4)
+      .map(([name, spend]) => `${name} x${spend.calls} ~${spend.tokens >= 1000 ? `${Math.round(spend.tokens / 1000)}k` : spend.tokens}`);
+    if (compiled.stats.toolResults > 0) dropped.push(`${compiled.stats.toolResults} tool results / ~${droppedResultTokens} tokens${byTool.length === 0 ? "" : ` (${byTool.join(", ")})`}`);
     if ((compiled.stats.erroredCalls ?? 0) > 0) dropped.push(`${compiled.stats.erroredCalls} errored calls`);
     if ((compiled.stats.hiddenCalls ?? 0) > 0) dropped.push(`${compiled.stats.hiddenCalls} bookkeeping calls`);
     const droppedLine = dropped.length === 0 ? "" : `; dropped ${dropped.join(", ")} (recall by seq)`;

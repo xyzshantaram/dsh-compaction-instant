@@ -270,11 +270,28 @@ export function stripNoiseXml(text, patterns) {
 
 // ── tool-call one-liner (VCC `_tool_summary`) ──────────────────────────────
 
-/** VCC's `_TOOL_SUMMARY_FIELDS`, extended for the DSH tool catalog. */
+/**
+ * Field selector meaning "every argument field this call carried, in order".
+ * A tool call that did not error is proof its arguments took effect, so for a
+ * state-setting tool the arguments ARE the state, and keeping them makes the
+ * dropped result pure redundancy.
+ */
+export const ALL_TOOL_FIELDS = "*";
+
+/**
+ * VCC's `_TOOL_SUMMARY_FIELDS`, extended for the DSH tool catalog. A value may
+ * be one field name, a list of field names, or `ALL_TOOL_FIELDS`. One rendered
+ * field prints bare (`* read "a.js"`); several print as `key=value` pairs.
+ */
 export const DEFAULT_TOOL_KEY_FIELDS = Object.freeze({
-  read: "file_path",
-  edit: "file_path",
-  write: "file_path",
+  read: ALL_TOOL_FIELDS,
+  edit: ALL_TOOL_FIELDS,
+  write: ALL_TOOL_FIELDS,
+  undo_last_edit: ALL_TOOL_FIELDS,
+  scratch_read: ALL_TOOL_FIELDS,
+  scratch_write: ALL_TOOL_FIELDS,
+  scratch_edit: ALL_TOOL_FIELDS,
+  scratch_mkdir: ALL_TOOL_FIELDS,
   glob: "pattern",
   grep: "pattern",
   bash: "command",
@@ -289,7 +306,14 @@ export const DEFAULT_TOOL_KEY_FIELDS = Object.freeze({
   interrupt_agent: "agent_id",
   job_kill: "job_id",
   job_output: "job_id",
-  send_message: "message"
+  send_message: ALL_TOOL_FIELDS,
+  // Ticket tools: a call that did not error leaves the ticket in exactly the
+  // state its arguments describe, so the agent gets that state for free.
+  set_ticket: ALL_TOOL_FIELDS,
+  get_tickets: ALL_TOOL_FIELDS,
+  move_ticket: ALL_TOOL_FIELDS,
+  attach_evidence: ALL_TOOL_FIELDS,
+  request_allowlist: ALL_TOOL_FIELDS
 });
 
 /**
@@ -303,6 +327,11 @@ export const DEFAULT_ARG_TOOLS = Object.freeze([
   "read",
   "write",
   "edit",
+  "undo_last_edit",
+  "scratch_read",
+  "scratch_write",
+  "scratch_edit",
+  "scratch_mkdir",
   "glob",
   "grep",
   "bash",
@@ -312,7 +341,21 @@ export const DEFAULT_ARG_TOOLS = Object.freeze([
   "subagent",
   "subagent_fork",
   "ralph",
-  "workflow"
+  "workflow",
+  // These declared a key field but were never whitelisted, so the mapping
+  // could never render.
+  "create_goal",
+  "update_goal",
+  "interrupt_agent",
+  "job_kill",
+  "job_output",
+  "send_message",
+  "request_allowlist",
+  // Ticket tools: the arguments carry the state the call set.
+  "set_ticket",
+  "get_tickets",
+  "move_ticket",
+  "attach_evidence"
 ]);
 
 /**
@@ -343,7 +386,18 @@ export function oneLineArg(value) {
 export function pickToolKeyArg(name, input, keyFields) {
   if (input === null || typeof input !== "object" || Array.isArray(input)) return undefined;
   const preferred = keyFields[name];
-  if (preferred !== undefined) {
+  if (Array.isArray(preferred) || preferred === ALL_TOOL_FIELDS) {
+    const fields = preferred === ALL_TOOL_FIELDS ? Object.keys(input) : preferred;
+    const parts = [];
+    for (const field of fields) {
+      const rendered = renderArgValue(input[field]);
+      if (rendered !== undefined) parts.push([field, rendered]);
+    }
+    // One field prints bare, so `* read "a.js"` reads as it always did.
+    // Several print as `key=value` pairs so the state is self-describing.
+    if (parts.length === 1) return parts[0][1];
+    if (parts.length > 1) return parts.map(([field, value]) => `${field}=${value}`).join(" ");
+  } else if (typeof preferred === "string") {
     const value = input[preferred];
     if (typeof value === "string" && value.length > 0) return value;
   }
@@ -351,6 +405,26 @@ export function pickToolKeyArg(name, input, keyFields) {
     if (typeof value === "string" && value.length > 0) return value;
   }
   return undefined;
+}
+
+/**
+ * Render one argument value for a tool line. Strings pass through, other JSON
+ * values render compactly, and empty values are skipped so an absent field
+ * never costs a `key=` with nothing after it.
+ * @param value - one argument value.
+ * @returns display text, or undefined when there is nothing worth showing.
+ */
+function renderArgValue(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string") return value.length > 0 ? value : undefined;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    const text = JSON.stringify(value);
+    return text === undefined || text === "{}" || text === "[]" ? undefined : text;
+  } catch {
+    /* a value that cannot serialise is not worth a place on the line */
+    return undefined;
+  }
 }
 
 /**
@@ -530,6 +604,8 @@ export function compileNodes(nodes, config, budgets) {
     // intro line can tell the agent the size of what it drops and where the
     // durable originals are.
     droppedResultTokens: 0,
+    /** Dropped result cost per tool name, so the agent can see which calls are dear. */
+    droppedByTool: {},
     erroredCalls: 0,
     hiddenCalls: 0,
     elidedToolRows: 0,
@@ -540,9 +616,17 @@ export function compileNodes(nodes, config, budgets) {
   // even though results never occupy entries, plus the size of the result it
   // dropped and whether that result was an error.
   const resultByCallId = new Map();
+  const nameByCallId = new Map();
   for (const node of nodes) {
     const message = node.message;
-    if (message === null || message === undefined || message.role !== "user" || message.content === undefined) continue;
+    if (message === null || message === undefined || message.content === undefined) continue;
+    if (message.role === "assistant") {
+      for (const block of message.content) {
+        if (block.type === "tool-call" && typeof block.id === "string") nameByCallId.set(block.id, String(block.name ?? "unknown"));
+      }
+      continue;
+    }
+    if (message.role !== "user") continue;
     const first = message.content[0];
     if (first !== undefined && first.type === "tool-result" && typeof first.toolCallId === "string") {
       resultByCallId.set(first.toolCallId, {
@@ -680,7 +764,13 @@ export function compileNodes(nodes, config, budgets) {
         // The pre-pass already priced this result; only an unpaired result
         // (no matching call in the span) needs pricing here.
         const priced = typeof first.toolCallId === "string" ? resultByCallId.get(first.toolCallId) : undefined;
-        stats.droppedResultTokens += priced === undefined ? estimateEntryTokens(projectToolResultText(first.content ?? [])) : priced.tokens;
+        const droppedTokens = priced === undefined ? estimateEntryTokens(projectToolResultText(first.content ?? [])) : priced.tokens;
+        stats.droppedResultTokens += droppedTokens;
+        const toolName = (typeof first.toolCallId === "string" ? nameByCallId.get(first.toolCallId) : undefined) ?? "unknown";
+        const bucket = stats.droppedByTool[toolName] ?? { calls: 0, tokens: 0 };
+        bucket.calls += 1;
+        bucket.tokens += droppedTokens;
+        stats.droppedByTool[toolName] = bucket;
         continue;
       }
       if (isCheckpointSource(message.source)) {
@@ -836,18 +926,33 @@ export function compileRegion(nodes, config) {
     attempts += 1;
   }
   let capped = false;
-  // Bring an oversized absorbed checkpoint inside its share before any
-  // elision runs, so the recent conversation is not sacrificed for an entry
-  // that cannot fit whatever gets dropped for it.
-  const checkpointShare = Math.max(MIN_CHECKPOINT_ENTRY_TOKENS, Math.floor(config.maxTokens * CHECKPOINT_ENTRY_SHARE));
-  for (const entry of result.entries) {
-    if (entry.kind !== "checkpoint") continue;
-    const before = estimateEntryTokens(entry.text);
-    if (before <= checkpointShare) continue;
-    const shrunk = truncateTokens(entry.text, checkpointShare, `seq ${entry.seq}`);
-    entry.text = shrunk.text;
-    result.stats.tokens -= before - estimateEntryTokens(entry.text);
-    capped = true;
+  // Absorbed checkpoint entries share ONE budget between them, never one
+  // budget each. A span can hold several prior checkpoints: a session whose
+  // shadowing was undone, or a manual compaction over a wide span. Giving
+  // each half the cap let six of them claim three times the whole budget, and
+  // the checkpoint-last elision rule below then sacrificed every ordinary
+  // entry for checkpoints that still did not fit. One live session compiled
+  // 4667 nodes into 7 entries that way.
+  //
+  // Spend the budget newest first: the newest checkpoint carries the most
+  // recent compressed history. Each older one keeps at least the floor, and
+  // whatever it cannot hold is truncated with provenance, so its full text
+  // stays recallable from the node it cites.
+  const checkpointEntries = result.entries.filter((entry) => entry.kind === "checkpoint");
+  if (checkpointEntries.length > 0) {
+    let remaining = Math.max(MIN_CHECKPOINT_ENTRY_TOKENS, Math.floor(config.maxTokens * CHECKPOINT_ENTRY_SHARE));
+    for (let index = checkpointEntries.length - 1; index >= 0; index -= 1) {
+      const entry = checkpointEntries[index];
+      // Reserve the floor for every checkpoint still to be considered.
+      const allowance = Math.max(MIN_CHECKPOINT_ENTRY_TOKENS, remaining - MIN_CHECKPOINT_ENTRY_TOKENS * index);
+      const before = estimateEntryTokens(entry.text);
+      if (before > allowance) {
+        entry.text = truncateTokens(entry.text, allowance, `seq ${entry.seq}`).text;
+        result.stats.tokens -= before - estimateEntryTokens(entry.text);
+        capped = true;
+      }
+      remaining = Math.max(0, remaining - estimateEntryTokens(entry.text));
+    }
   }
   if (result.stats.tokens > config.maxTokens) {
     const entries = result.entries;
@@ -855,6 +960,9 @@ export function compileRegion(nodes, config) {
     // anywhere in the list first, so conversation text and prior-checkpoint
     // knowledge survive elision before the logs do. The marker's seq range is
     // the dropped rows' span (approximate: surviving text may sit inside it).
+    // This pass drops the OLDEST low-value rows and stops the moment the total
+    // is under the cap, so the newest tool rows survive by construction. They
+    // carry the `-> result N` pointer and the size of the result they dropped.
     const toolRows = [];
     while (entries.length > 1 && result.stats.tokens > config.maxTokens) {
       const index = entries.findIndex((entry, position) => position < entries.length - 1 && LOW_VALUE_KINDS.has(entry.kind));

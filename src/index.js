@@ -357,7 +357,13 @@ function resolveToolKeyFields(configured) {
   if (!isUnknownRecord(configured)) throw new Error("InstantCompactionConfig: toolKeyFields must be an object");
   for (const [tool, field] of Object.entries(configured)) {
     if (typeof tool !== "string" || tool.length === 0) throw new Error("InstantCompactionConfig: toolKeyFields keys must be non-empty strings");
-    if (typeof field !== "string" || field.length === 0) throw new Error(`InstantCompactionConfig: toolKeyFields["${tool}"] must be a non-empty string`);
+    const listed = Array.isArray(field);
+    if (listed && (field.length === 0 || field.some((entry) => typeof entry !== "string" || entry.length === 0))) {
+      throw new Error(`InstantCompactionConfig: toolKeyFields["${tool}"] must be an array of non-empty strings`);
+    }
+    if (!listed && (typeof field !== "string" || field.length === 0)) {
+      throw new Error(`InstantCompactionConfig: toolKeyFields["${tool}"] must be a non-empty string, a list of field names, or "*"`);
+    }
   }
   return { ...configured };
 }

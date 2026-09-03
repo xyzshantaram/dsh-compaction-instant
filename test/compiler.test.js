@@ -355,6 +355,34 @@ test("compileRegion drops errored calls and reports what each dropped result cos
   assert.match(text, /\[\d+\.\dk tokens dropped\]/, "the surviving call reports what its result cost");
 });
 
+test("several absorbed checkpoints share one budget instead of one each", () => {
+  // Regression from live session a0872a7d. Undoing that session's shadowing
+  // put six prior checkpoints in one span. The share was applied per entry, so
+  // six could claim three times the whole cap, and the checkpoint-last elision
+  // rule then sacrificed every ordinary entry to make room for checkpoints
+  // that still did not fit: 4667 nodes compiled to 7 entries and 832
+  // conversation entries were elided.
+  const nodes = [];
+  for (let seq = 1; seq <= 6; seq += 1) {
+    nodes.push({ seq, message: { role: "user", content: [{ type: "text", text: `checkpoint ${seq} ${"alpha ".repeat(500)}` }], source: { kind: "plugin", plugin: "compact", compactionId: `c${seq}` } } });
+  }
+  for (let seq = 7; seq <= 46; seq += 1) {
+    nodes.push({ seq, message: { role: "user", content: [{ type: "text", text: `talk ${seq} ${"beta ".repeat(30)}` }], source: { kind: "user" } } });
+  }
+  const maxTokens = 3000;
+  const { entries, stats } = compileRegion(nodes, { ...CONFIG, maxTokens });
+  const checkpointTokens = entries
+    .filter((entry) => entry.kind === "checkpoint")
+    .reduce((total, entry) => total + estimateEntryTokens(entry.text), 0);
+  // One collective budget, not one each. The slack covers the two estimators.
+  assert.ok(checkpointTokens <= maxTokens * 0.5 + 400, `checkpoints share one budget (${checkpointTokens})`);
+  // The conversation is not sacrificed for them. Under the old per-entry
+  // share these six fitted their own allowance, took the whole cap between
+  // them, and left nothing: every text entry was elided.
+  assert.ok(entries.filter((entry) => entry.kind === "text").length >= 15, `conversation entries survive (${entries.filter((e) => e.kind === "text").length})`);
+  assert.ok(stats.elidedRows < 30, `most conversation survives (${stats.elidedRows} elided)`);
+});
+
 test("compileRegion elides tool rows before conversation text", () => {
   const nodes = [];
   for (let seq = 1; seq <= 8; seq += 1) {
