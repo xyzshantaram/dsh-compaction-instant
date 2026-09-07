@@ -10,7 +10,9 @@ import { isWorthCompacting, resolveCompactSpec, resolveConfig, resolveTargetPoli
 
 test("resolveConfig applies the documented defaults", () => {
   const config = resolveConfig({});
-  assert.equal(config.thresholdRatio, 0.5);
+  assert.equal(config.thresholdRatio, 0.8);
+  // Unconfigured: null propagates so the window tier chooses the absolute.
+  assert.equal(config.compactAtTokens, null);
   assert.equal(config.retainTurns, 1);
   assert.equal(config.retainTokens, 5120);
   assert.equal(config.maxTokens, 8192);
@@ -125,7 +127,7 @@ test("resolveConfig validates modelPolicies and rejects duplicates", () => {
 test("resolveTargetPolicy overlays exact-target fields over defaults", () => {
   const config = resolveConfig({ retainTurns: 2, retainTokens: 3000 });
   const policy = resolveTargetPolicy(config, { provider: "p", model: "m" });
-  assert.equal(policy.thresholdRatio, 0.5);
+  assert.equal(policy.thresholdRatio, 0.8);
   assert.equal(policy.retainTurns, 2);
   assert.equal(policy.retainTokens, 3000);
   const overridden = resolveConfig({
@@ -140,7 +142,10 @@ test("resolveTargetPolicy overlays exact-target fields over defaults", () => {
 test("resolveCompactSpec scales budgets and rejects invalid windows", () => {
   const policy = resolveTargetPolicy(resolveConfig({}), { provider: "p", model: "m" });
   const spec = resolveCompactSpec(policy, 1000);
-  assert.equal(spec.thresholdTokens, 500);
+  // A 1000-token window cannot hold the 200000 small-window tier, so the 0.8
+  // ratio guard binds; the spec still carries the resolved tier absolute.
+  assert.equal(spec.thresholdTokens, 800);
+  assert.equal(spec.compactAtTokens, 200000);
   assert.equal(spec.retainTurns, 1);
   assert.equal(spec.retainTokens, 5120);
   assert.throws(() => resolveCompactSpec(policy, 0), TargetPressureConfigError);
@@ -150,17 +155,46 @@ test("resolveCompactSpec scales budgets and rejects invalid windows", () => {
   assert.equal(scaled.retainTokens, 4000);
 });
 
-test("resolveCompactSpec triggers on the smaller of the absolute budget and the ratio", () => {
-  // The absolute trigger keeps the compaction point predictable whatever model
-  // is routed; the ratio still guards a context window too small to hold it.
+test("resolveCompactSpec triggers on the smaller of the tier absolute and the ratio", () => {
+  // Unconfigured, the window tier picks the absolute (null propagates from
+  // resolveConfig); the ratio still guards a window too small to hold it.
   const config = resolveConfig({});
-  assert.equal(config.compactAtTokens, 250000);
+  assert.equal(config.compactAtTokens, null);
   assert.equal(config.compactToTokens, 15000);
   const policy = resolveTargetPolicy(config, { provider: "p", model: "m" });
-  // A one-million-token window: the absolute budget binds.
+  // A one-million-token window: the big-window tier binds.
   assert.equal(resolveCompactSpec(policy, 1_000_000).thresholdTokens, 250000);
-  // A 128k window: half the window binds, well below the absolute budget.
-  assert.equal(resolveCompactSpec(policy, 128_000).thresholdTokens, 64000);
+  assert.equal(resolveCompactSpec(policy, 1_000_000).compactAtTokens, 250000);
+  // A 128k window: the small-window tier loses to the ratio guard.
+  assert.equal(resolveCompactSpec(policy, 128_000).thresholdTokens, 102400);
+  assert.equal(resolveCompactSpec(policy, 128_000).compactAtTokens, 200000);
+});
+
+test("resolveCompactSpec picks the trigger tier from the context window", () => {
+  const policy = resolveTargetPolicy(resolveConfig({}), { provider: "p", model: "m" });
+  const threshold = (contextWindow) => resolveCompactSpec(policy, contextWindow).thresholdTokens;
+  const absolute = (contextWindow) => resolveCompactSpec(policy, contextWindow).compactAtTokens;
+  // A 250k window sits on the small tier (the ratio agrees exactly here).
+  assert.equal(threshold(250_000), 200_000);
+  assert.equal(absolute(250_000), 200_000);
+  // The 262144 boundary itself stays on the small tier.
+  assert.equal(threshold(262_144), 200_000);
+  assert.equal(absolute(262_144), 200_000);
+  // One token above the boundary flips the tier, but the 0.8 ratio guard
+  // binds first: min(250000, 209716). Same deliberate class as 300k → 240k.
+  assert.equal(threshold(262_145), 209_716);
+  assert.equal(absolute(262_145), 250_000);
+  // A 300k window is ratio-bounded by design, not tier-bounded.
+  assert.equal(threshold(300_000), 240_000);
+  // A one-million-token window holds the big tier outright.
+  assert.equal(threshold(1_000_000), 250_000);
+  // An explicitly configured absolute always wins over the tier.
+  const explicit = resolveTargetPolicy(resolveConfig({ compactAtTokens: 100_000 }), { provider: "p", model: "m" });
+  assert.equal(resolveCompactSpec(explicit, 262_144).thresholdTokens, 100_000);
+  assert.equal(resolveCompactSpec(explicit, 262_144).compactAtTokens, 100_000);
+  // An explicit ratio is still honored: min(200000, 125000).
+  const guarded = resolveTargetPolicy(resolveConfig({ thresholdRatio: 0.5 }), { provider: "p", model: "m" });
+  assert.equal(resolveCompactSpec(guarded, 250_000).thresholdTokens, 125_000);
 });
 
 test("isWorthCompacting rejects a span that cannot pay for the checkpoint framing", () => {

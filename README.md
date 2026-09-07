@@ -50,8 +50,8 @@ All fields optional; defaults shown.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `thresholdRatio` | `0.5` | Fraction of the routed model's context window that triggers automatic compaction; the effective trigger is the smaller of this and `compactAtTokens` |
-| `compactAtTokens` | `250000` | Absolute surface-token trigger. Measured on the conversation surface, the only part a compaction can shrink, so it ignores the system prompt, the tool schemas, and provider cache accounting |
+| `thresholdRatio` | `0.8` | Headroom guard: fraction of the routed model's context window that caps the trigger; the ratio only binds on windows too small to hold the tier absolute |
+| `compactAtTokens` | tiered (unset) | Absolute surface-token trigger, picked by window tier when unset: windows above 262144 tokens compact at `250000`, smaller windows at `200000`. An explicit value always wins. Measured on the conversation surface, the only part a compaction can shrink, so it ignores the system prompt, the tool schemas, and provider cache accounting |
 | `compactToTokens` | `15000` | Surface tokens left after a compaction that fires at the trigger, applied as a ratio: a surface that overshot the trigger earns a proportionately larger budget (340000 maps to 20400) |
 | `retainTurns` | `1` | Preferred complete recent turns kept verbatim (automatic and manual `/compact`); never overrides the ceiling |
 | `retainTokens` | `5120` | **Hard** retained-region token ceiling: older whole turns are added only while the total fits, and when the latest turn alone exceeds it, only the fitting suffix of that turn is kept |
@@ -72,6 +72,17 @@ All fields optional; defaults shown.
 | `compactionRetries` / `maxOverflowRetries` | `1` / `1` | Retry budgets, same semantics as basic |
 | `summarizationProvider` / `summarizationModel` | — | Accepted for config drop-in compatibility; **inert** — this backend never routes a model |
 
+The unconfigured trigger is window-tiered — 262144 tokens (the classic 256k window) is the boundary:
+
+| Context window | Trigger (unconfigured) |
+|---|---|
+| 250000 | 200000 |
+| 262144 | 200000 |
+| 300000 | 240000 (ratio guard binds — deliberate) |
+| 1000000 | 250000 |
+
+An explicit `compactAtTokens` always wins over the tier, and the ratio still caps the trigger on windows too small to hold the absolute.
+
 The tool and command plugins each take their own `{ maxRecallTokens?: 16000, maxSearchHits?: 50 }` config.
 
 > **Cordis config gotcha:** the plugin row's config passes through the schemastery schema, whose `~standard` adapter injects **`[]` for every absent array key** (`toolArgTools`, `hideTools`, `noisePatterns`, `toolKeyFields`, `modelPolicies`). The resolver treats an empty list as *unset* and falls back to the defaults — so a missing `toolArgTools` keeps the built-in whitelist (never disable it by writing `toolArgTools: []`; empty means default). `debug: true` writes per-compile diagnostics to the configured `debugLogPath` (default `$DSH_HOME/compaction-debug.log`).
@@ -86,8 +97,8 @@ Since 0.1.4 the engine exposes a **user-owned settings namespace** (`compaction-
 |---|---|
 | `checkpointCap` | Total compiler-token budget for one checkpoint (default 65536) |
 | `auto` | Register automatic between-step compaction |
-| `thresholdRatio` | Context-window fraction that triggers automatic compaction (default `0.5`) |
-| `compactAtTokens` | Absolute surface-token trigger for automatic compaction (default `250000`) |
+| `thresholdRatio` | Context-window fraction that caps the automatic-compaction trigger (default `0.8`) |
+| `compactAtTokens` | Absolute surface-token trigger for automatic compaction (unset = window tier: `200000` at or below a 262144-token window, `250000` above) |
 | `compactToTokens` | Surface tokens left after a compaction at the trigger (default `15000`) |
 | `retainTurns` | Preferred complete recent turns kept verbatim (default `1`) |
 | `retainTokens` | **Hard** retained-token ceiling: whole turns (or, when the latest turn is larger, a fitting suffix of it) never exceed it (default `5120`) |

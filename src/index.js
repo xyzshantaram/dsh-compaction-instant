@@ -22,10 +22,19 @@ import { assertNoActiveCompaction, compactSurfaceRegion, selectCompactableRange 
 
 // ── configuration resolution ───────────────────────────────────────────────
 
-/** Default request-pressure fraction for every routed model. */
-const DEFAULT_THRESHOLD_RATIO = 0.5;
 /**
- * Default absolute surface-token trigger.
+ * Default request-pressure fraction for every routed model. A headroom guard,
+ * not the primary trigger: the window-dependent absolute tier fires first on
+ * every window big enough to hold it, and the ratio only binds below that.
+ * Unconfigured triggers: 250k window → 200k, 262144 → 200k, 300k → 240k
+ * (ratio-bounded, deliberate), 1M → 250k.
+ */
+const DEFAULT_THRESHOLD_RATIO = 0.8;
+/**
+ * Absolute trigger for windows above BIG_WINDOW_BOUNDARY (the big-window
+ * tier). Unset in configuration, the window tier in resolveCompactSpec picks
+ * this or SMALL_WINDOW_TIER_TOKENS; an explicitly configured value always
+ * wins over the tier.
  *
  * Compaction fires on the size of the conversation surface, because that is
  * the only part a compaction can shrink. The token meter's request-pressure
@@ -38,6 +47,24 @@ const DEFAULT_THRESHOLD_RATIO = 0.5;
  * the checkpoint it just wrote.
  */
 const DEFAULT_COMPACT_AT_TOKENS = 250000;
+/**
+ * Context-window boundary (tokens) separating the two absolute trigger tiers:
+ * the classic 256k window. Windows at or below it compact at
+ * SMALL_WINDOW_TIER_TOKENS; windows above it compact at
+ * DEFAULT_COMPACT_AT_TOKENS.
+ *
+ * WHY a constant, not configuration: the split is window-dependent, so it can
+ * only be applied where the window is known — resolveCompactSpec.
+ */
+const BIG_WINDOW_BOUNDARY = 262144;
+/**
+ * Absolute trigger for windows at or below BIG_WINDOW_BOUNDARY (the
+ * small-window tier).
+ *
+ * WHY a constant, not configuration: the split is window-dependent, so it can
+ * only be applied where the window is known — resolveCompactSpec.
+ */
+const SMALL_WINDOW_TIER_TOKENS = 200000;
 /**
  * Default surface-token budget remaining after a compaction that fires at the
  * trigger. This is a ratio, not a flat size: compaction can only fire at a
@@ -181,7 +208,9 @@ export function resolveConfig(config = {}) {
   validatePolicy(config, "InstantCompactionConfig");
   if (config.auto !== undefined && typeof config.auto !== "boolean") throw new Error("InstantCompactionConfig: auto must be a boolean");
   const thresholdRatio = config.thresholdRatio ?? DEFAULT_THRESHOLD_RATIO;
-  const compactAtTokens = config.compactAtTokens ?? DEFAULT_COMPACT_AT_TOKENS;
+  // Null means "no configured absolute": the window tier in
+  // resolveCompactSpec picks the absolute. An explicit value always wins.
+  const compactAtTokens = config.compactAtTokens ?? null;
   const compactToTokens = config.compactToTokens ?? DEFAULT_COMPACT_TO_TOKENS;
   const retainTurns = config.retainTurns ?? DEFAULT_RETAIN_TURNS;
   const retainTokens = config.retainTokens ?? DEFAULT_RETAIN_TOKENS;
@@ -253,6 +282,9 @@ export function resolveTargetPolicy(config, target) {
 
 /**
  * Scale one routed policy into concrete token budgets for its model capacity.
+ * An unconfigured absolute resolves from the context-window tier (250000
+ * above a 262144-token window, 200000 at or below it); the returned spec
+ * carries the resolved absolute so callers never see the null.
  * @param policy - merged policy for the exact routed target.
  * @param contextWindow - positive adapter-owned capacity for that target.
  * @returns detached immutable pressure and retention budgets.
@@ -260,15 +292,20 @@ export function resolveTargetPolicy(config, target) {
 export function resolveCompactSpec(policy, contextWindow) {
   const targetKey = `${policy.target.provider}/${policy.target.model}`;
   if (!Number.isInteger(contextWindow) || contextWindow <= 0) throw new TargetPressureConfigError(targetKey, `InstantCompactionConfig: contextWindow (${contextWindow}) must be a positive integer`);
-  // The absolute trigger keeps the compaction point predictable whatever model
-  // is routed. The ratio still guards a context window too small to hold it.
+  // The window tier picks the absolute trigger: windows above
+  // BIG_WINDOW_BOUNDARY compact at DEFAULT_COMPACT_AT_TOKENS, smaller windows
+  // at SMALL_WINDOW_TIER_TOKENS. An explicitly configured absolute always wins
+  // over the tier. The ratio still guards a context window too small to hold
+  // the absolute, so the trigger stays predictable whatever model is routed.
+  const tierTokens = contextWindow > BIG_WINDOW_BOUNDARY ? DEFAULT_COMPACT_AT_TOKENS : SMALL_WINDOW_TIER_TOKENS;
+  const absoluteTokens = policy.compactAtTokens ?? tierTokens;
   const ratioTokens = Math.floor(contextWindow * policy.thresholdRatio);
-  const thresholdTokens = Math.min(policy.compactAtTokens, ratioTokens);
+  const thresholdTokens = Math.min(absoluteTokens, ratioTokens);
   return deepFreeze({
     target: { ...policy.target },
     contextWindow,
     thresholdRatio: policy.thresholdRatio,
-    compactAtTokens: policy.compactAtTokens,
+    compactAtTokens: absoluteTokens,
     compactToTokens: policy.compactToTokens,
     thresholdTokens,
     retainTurns: policy.retainTurns,
@@ -311,7 +348,8 @@ function validatePolicy(config, name) {
   const compactionRetries = config.compactionRetries;
   const maxOverflowRetries = config.maxOverflowRetries;
   if (thresholdRatio !== undefined) assertRatio(`${name}.thresholdRatio`, thresholdRatio);
-  if (config.compactAtTokens !== undefined) assertPositiveInteger(`${name}.compactAtTokens`, config.compactAtTokens);
+  // Null is "unset": the window tier chooses (see resolveCompactSpec).
+  if (config.compactAtTokens !== undefined && config.compactAtTokens !== null) assertPositiveInteger(`${name}.compactAtTokens`, config.compactAtTokens);
   if (config.compactToTokens !== undefined) assertPositiveInteger(`${name}.compactToTokens`, config.compactToTokens);
   if (retainTurns !== undefined) assertPositiveInteger(`${name}.retainTurns`, retainTurns);
   if (retainTokens !== undefined) assertNonNegativeInteger(`${name}.retainTokens`, retainTokens);
@@ -530,14 +568,16 @@ export class InstantCompactionEngine extends CompactionEngine {
   /**
    * Settings-exposed subset of the engine configuration. Defaults mirror the
    * engine's own `DEFAULT_*` constants so the resolved settings layer is
-   * exactly what `resolveConfig` would compute. Debug behavior stays
-   * engine-config-only (`debug`, `debugLogPath`, `DSH_COMPACTION_DEBUG`).
+   * exactly what `resolveConfig` would compute. `compactAtTokens` is the
+   * deliberate exception: it carries no default, so an unset value leaves the
+   * window tier in `resolveCompactSpec` to choose the absolute. Debug behavior
+   * stays engine-config-only (`debug`, `debugLogPath`, `DSH_COMPACTION_DEBUG`).
    */
   static SETTINGS_SCHEMA = z.object({
     checkpointCap: z.number().step(1).min(1).default(DEFAULT_CHECKPOINT_CAP),
     auto: z.boolean().default(true),
     thresholdRatio: z.number().min(0).max(1).default(DEFAULT_THRESHOLD_RATIO),
-    compactAtTokens: z.number().step(1).min(1).default(DEFAULT_COMPACT_AT_TOKENS),
+    compactAtTokens: z.number().step(1).min(1),
     compactToTokens: z.number().step(1).min(1).default(DEFAULT_COMPACT_TO_TOKENS),
     retainTurns: z.number().step(1).min(1).default(DEFAULT_RETAIN_TURNS),
     retainTokens: z.number().step(1).min(0).default(DEFAULT_RETAIN_TOKENS)
@@ -686,16 +726,25 @@ export class InstantCompactionEngine extends CompactionEngine {
    * source. Each retry halves the target again.
    * @param shadowedTokenCount - priced token count of the span being replaced.
    * @param attempt - zero-based compile attempt; each one tightens the cap.
+   * @param triggerTokens - surface level that fired the compaction and anchors
+   *   the trigger-to-budget proportion. Omit it outside the pressure path to
+   *   anchor on the configured absolute (big-window tier when unconfigured).
    * @returns the cap in compiler tokens.
    */
-  effectiveMaxTokens(shadowedTokenCount, attempt = 0, incomingCheckpointTokens = 0) {
+  effectiveMaxTokens(shadowedTokenCount, attempt = 0, incomingCheckpointTokens = 0, triggerTokens = this.config.compactAtTokens ?? DEFAULT_COMPACT_AT_TOKENS) {
     const config = this.config;
-    // Hold the compression ratio the trigger promises. Compaction can only run
-    // at a step boundary, so the surface may overshoot the trigger before it
-    // fires; a larger surface then earns a proportionately larger checkpoint.
-    // Below the trigger the budget stays flat at compactToTokens.
+    // Hold the compression ratio the trigger promises, anchored on the surface
+    // level that actually fired it (the resolved spec threshold on the
+    // pressure path). Compaction can only run at a step boundary, so the
+    // surface may overshoot the trigger before it fires; a larger surface then
+    // earns a proportionately larger checkpoint. Below the trigger the budget
+    // stays flat at compactToTokens.
     const surfaceTokens = shadowedTokenCount + config.retainTokens;
-    const targetSurface = Math.max(config.compactToTokens, Math.floor(surfaceTokens * config.compactToTokens / config.compactAtTokens));
+    // The resolved config carries null when no absolute is configured (the
+    // window tier chooses at spec time), and a degenerate window can resolve a
+    // zero threshold: both fall back to the configured-or-tier absolute.
+    const trigger = Number.isInteger(triggerTokens) && triggerTokens > 0 ? triggerTokens : (config.compactAtTokens ?? DEFAULT_COMPACT_AT_TOKENS);
+    const targetSurface = Math.max(config.compactToTokens, Math.floor(surfaceTokens * config.compactToTokens / trigger));
     // The retained tail is verbatim, so the checkpoint gets what is left.
     const budget = Math.max(MIN_CHECKPOINT_TOKENS, targetSurface - config.retainTokens);
     // A checkpoint may never plan to spend more than a fraction of the span it
@@ -720,8 +769,10 @@ export class InstantCompactionEngine extends CompactionEngine {
    *   routes a model call through it.
    * @param signal - optional cancellation checked before the compile.
    * @param attempt - zero-based compile attempt, forwarded to the cap.
+   * @param triggerTokens - resolved fire-level trigger forwarded to the cap;
+   *   omitted outside the pressure path.
    * @returns ordered checkpoint entries plus backend provenance and stats.
-   */  async compile(prepared, agent, signal, attempt = 0) {
+   */  async compile(prepared, agent, signal, attempt = 0, triggerTokens) {
     signal?.throwIfAborted();
     const nodes = prepared.shadowedSeqs.map((seq) => {
       const event = prepared.session.events[seq];
@@ -750,7 +801,7 @@ export class InstantCompactionEngine extends CompactionEngine {
       const text = unframeCheckpointText(node.message.content);
       if (text.length > 0) incomingCheckpointTokens += estimateEntryTokens(text);
     }
-    const cap = this.effectiveMaxTokens(prepared.shadowedTokenCount, attempt, incomingCheckpointTokens);
+    const cap = this.effectiveMaxTokens(prepared.shadowedTokenCount, attempt, incomingCheckpointTokens, triggerTokens);
     engineDebug(this.config, `compile span=${prepared.shadowedSeqs.length} seqs=${prepared.shadowedSeqs[0]}-${prepared.shadowedSeqs[prepared.shadowedSeqs.length - 1]} shadowedTokens=${prepared.shadowedTokenCount} attempt=${attempt} cap=${cap} checkpoints=${checkpointCount}`);
     const { entries, stats, capped } = compileRegion(nodes, {
       ...this.config,
@@ -813,7 +864,7 @@ export class InstantCompactionEngine extends CompactionEngine {
     for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
       const range = selectCompactableRange(agent.session, measurement, spec.retainTurns, spec.retainTokens);
       if (!isWorthCompacting(range, "pressure")) break;
-      result = await this.compactRegion(range.start, range.end, agent, signal);
+      result = await this.compactRegion(range.start, range.end, agent, signal, spec.thresholdTokens);
       measurement = meter.measure(agent.session);
       if (measurement.surfaceTokens < spec.thresholdTokens) return result;
     }
@@ -830,10 +881,12 @@ export class InstantCompactionEngine extends CompactionEngine {
    * @param end - inclusive last surface-node seq.
    * @param agent - owner of the target session, retained for signature parity.
    * @param signal - optional cancellation signal.
+   * @param triggerTokens - resolved fire-level trigger for the cap; omitted
+   *   outside the pressure path.
    * @returns the successful durable compaction result.
    */
-  async compactRegion(start, end, agent, signal) {
-    return compactSurfaceRegion(this.regionDependencies(), agent.session, start, end, agent, {
+  async compactRegion(start, end, agent, signal, triggerTokens) {
+    return compactSurfaceRegion(this.regionDependencies(triggerTokens), agent.session, start, end, agent, {
       owner: "current-turn",
       stability: "whole-surface"
     }, signal);
@@ -874,11 +927,15 @@ export class InstantCompactionEngine extends CompactionEngine {
       throw new ManualCompactionError("busy", "manual compaction requires an idle agent with no waking queued work", { cause: error });
     }
   }
-  /** Bind the effective token meter and dynamically dispatched compile hook. */
-  regionDependencies() {
+  /**
+   * Bind the effective token meter and dynamically dispatched compile hook.
+   * @param triggerTokens - resolved fire-level trigger for the cap; omitted
+   *   outside the pressure path.
+   */
+  regionDependencies(triggerTokens) {
     return {
       meter: this.ctx.tokenMeter,
-      compile: (prepared, owner, abort, attempt) => this.compile(prepared, owner, abort, attempt)
+      compile: (prepared, owner, abort, attempt) => this.compile(prepared, owner, abort, attempt, triggerTokens)
     };
   }
 }

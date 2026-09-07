@@ -11,6 +11,8 @@ import { InstantCompactionEngine } from "../src/index.js";
  * The settings schema mirrors the engine's own defaults, so the resolved
  * settings layer is exactly what resolveConfig computes. These assertions
  * pin that contract: bumping an engine default must bump the schema default.
+ * `compactAtTokens` is the deliberate exception — it carries no schema
+ * default, so an unset value leaves the window tier to choose the absolute.
  * The settings surface is the cap plus the auto-compaction controls only —
  * the deprecated `checkpointScale`/`maxTokens` knobs are not exposed.
  */
@@ -19,7 +21,9 @@ test("SETTINGS_SCHEMA defaults mirror engine defaults", () => {
   const resolved = schema({});
   assert.equal(resolved.checkpointCap, 65536);
   assert.equal(resolved.auto, true);
-  assert.equal(resolved.thresholdRatio, 0.5);
+  assert.equal(resolved.thresholdRatio, 0.8);
+  // No schema default: the window tier resolves the absolute at spec time.
+  assert.equal(resolved.compactAtTokens, undefined);
   assert.equal(resolved.retainTurns, 1);
   assert.equal(resolved.retainTokens, 5120);
 });
@@ -29,12 +33,15 @@ test("SETTINGS_SCHEMA validates user overrides and rejects malformed values", ()
   assert.equal(schema({ checkpointCap: 131072 }).checkpointCap, 131072);
   assert.equal(schema({ auto: false }).auto, false);
   assert.equal(schema({ thresholdRatio: 0.25 }).thresholdRatio, 0.25);
+  assert.equal(schema({ compactAtTokens: 100000 }).compactAtTokens, 100000);
   assert.equal(schema({ retainTurns: 3 }).retainTurns, 3);
   assert.equal(schema({ retainTokens: 50000 }).retainTokens, 50000);
   assert.throws(() => schema({ checkpointCap: -1 }));
   assert.throws(() => schema({ checkpointCap: 1.5 }));
   assert.throws(() => schema({ thresholdRatio: 1.5 }));
   assert.throws(() => schema({ thresholdRatio: -0.1 }));
+  assert.throws(() => schema({ compactAtTokens: 0 }));
+  assert.throws(() => schema({ compactAtTokens: 1.5 }));
   assert.throws(() => schema({ retainTurns: 0 }));
   assert.throws(() => schema({ retainTurns: 1.5 }));
   assert.throws(() => schema({ retainTokens: -1 }));

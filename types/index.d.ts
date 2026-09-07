@@ -31,16 +31,19 @@ export interface ModelPolicyOverride {
 /** Public plugin configuration, all fields optional. */
 export interface InstantCompactionConfig {
     /**
-     * Fraction of the routed model's context window that triggers automatic
-     * compaction. The effective trigger is the smaller of this and
-     * `compactAtTokens`. Default 0.5.
+     * Fraction of the routed model's context window that caps the automatic
+     * compaction trigger. A headroom guard, not the primary trigger: the
+     * window-dependent absolute tier fires first wherever the window can hold
+     * it. Default 0.8.
      */
     thresholdRatio?: number;
     /**
      * Absolute surface-token trigger for automatic compaction. Measured on the
      * conversation surface, which is the only part a compaction can shrink, so
      * the trigger is unaffected by the system prompt, the tool schemas, or the
-     * provider's cache accounting. Default 250000.
+     * provider's cache accounting. Unset by default: windows above 262144
+     * tokens compact at 250000, smaller windows at 200000. An explicit value
+     * always wins over the tier.
      */
     compactAtTokens?: number;
     /**
@@ -195,18 +198,21 @@ export declare class InstantCompactionEngine extends CompactionEngineBase {
      * tokens: the `compactToTokens` ratio less the retained tail, never above
      * a fraction of the span being replaced, never above `checkpointCap`, and
      * never below what an absorbed prior checkpoint needs to survive.
+     * Anchored on the surface level that fired the compaction; omit
+     * `triggerTokens` outside the pressure path to anchor on the configured
+     * absolute.
      */
-    effectiveMaxTokens(shadowedTokenCount: number, attempt?: number, incomingCheckpointTokens?: number): number;
+    effectiveMaxTokens(shadowedTokenCount: number, attempt?: number, incomingCheckpointTokens?: number, triggerTokens?: number): number;
     /** Compile one priced region with the deterministic compiler; the sole subclass hook. */
     compile(prepared: {
         shadowedSeqs: readonly number[];
         session: Session;
         [key: string]: unknown;
-    }, agent: Agent | undefined, signal: AbortSignal | undefined): Promise<CompiledRegion>;
+    }, agent: Agent | undefined, signal: AbortSignal | undefined, attempt?: number, triggerTokens?: number): Promise<CompiledRegion>;
     /** Compact for step-boundary pressure or provider-confirmed context overflow. */
     compactIfNeeded(agent: Agent, trigger: 'pressure' | 'context-overflow', signal: AbortSignal): Promise<CompactionResult | null>;
     /** Compact one inclusive positional range from the agent-owned surface. */
-    compactRegion(start: number, end: number, agent: Agent, signal: AbortSignal): Promise<CompactionResult>;
+    compactRegion(start: number, end: number, agent: Agent, signal: AbortSignal, triggerTokens?: number): Promise<CompactionResult>;
     /** Force one useful idle-session compaction below the pressure threshold. */
     compactNow(agent: Agent, signal: AbortSignal, sourceCommandId?: string): Promise<CompactionResult | null>;
 }

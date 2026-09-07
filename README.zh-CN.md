@@ -48,8 +48,8 @@ Recall 能取回**一切**：文本、推理过程、工具调用的完整参数
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `thresholdRatio` | `0.5` | 上下文用到多大比例时自动触发压缩（0.5 = 用到一半）；实际触发点取本项与 `compactAtTokens` 的较小值 |
-| `compactAtTokens` | `250000` | 触发自动压缩的表层 token 绝对阈值。只统计会话表层，即压缩唯一能缩小的部分，因此不受系统提示词、工具 schema 或服务端缓存计费影响 |
+| `thresholdRatio` | `0.8` | 上下文窗口占比，作为触发点的上限保护；窗口装得下分档绝对值时分档先触发，只有窗口太小时本项才生效 |
+| `compactAtTokens` | 分档（默认不设） | 触发自动压缩的表层 token 绝对阈值，不设置时按窗口分档：窗口大于 262144 时取 `250000`，小于等于时取 `200000`；显式设置的值永远优先。只统计会话表层，即压缩唯一能缩小的部分，因此不受系统提示词、工具 schema 或服务端缓存计费影响 |
 | `compactToTokens` | `15000` | 在阈值处压缩后保留的表层 token 预算，按比例生效：若表层在步骤边界前已超过阈值，预算按比例放大（340000 对应 20400） |
 | `retainTurns` | `1` | 优先保留的完整回合数（自动压缩和手动 `/compact` 都按此规则；不突破上限） |
 | `retainTokens` | `5120` | 保留区 token **硬上限**：向前补足完整回合时总量永不超出；若最近回合本身就超过它，只保留该回合内能装下的部分 |
@@ -70,6 +70,17 @@ Recall 能取回**一切**：文本、推理过程、工具调用的完整参数
 | `compactionRetries` / `maxOverflowRetries` | `1` / `1` | 重试次数，含义和官方引擎一样 |
 | `summarizationProvider` / `summarizationModel` | — | 仅为兼容官方配置而接受；**不起作用**——本引擎从不调用模型 |
 
+不设置 `compactAtTokens` 时，触发点按窗口分档——262144 token（经典 256k 窗口）是分界线：
+
+| 上下文窗口 | 触发点（未设置时） |
+|---|---|
+| 250000 | 200000 |
+| 262144 | 200000 |
+| 300000 | 240000（比例保护生效，是有意为之） |
+| 1000000 | 250000 |
+
+显式设置的 `compactAtTokens` 永远优先于分档；窗口太小装不下绝对值时，比例仍然封顶。
+
 recall 工具和命令插件各自接受 `{ maxRecallTokens?: 16000, maxSearchHits?: 50 }` 配置。
 
 > **Cordis 配置坑：** 插件行的配置要经过 schemastery schema 校验，它的 `~standard` 适配器会给**每个没写的数组项注入 `[]`**（`toolArgTools`、`hideTools`、`noisePatterns`、`toolKeyFields`、`modelPolicies`）。本引擎把空数组当作"没设置"，会回退到默认值——所以不写 `toolArgTools` 就自动用内置白名单（千万别用 `toolArgTools: []` 想关掉它；空 = 默认）。`debug: true` 会把每次压缩的诊断写进 `debugLogPath` 指定的文件（默认 `$DSH_HOME/compaction-debug.log`）。
@@ -84,7 +95,7 @@ recall 工具和命令插件各自接受 `{ maxRecallTokens?: 16000, maxSearchHi
 |---|---|
 | `checkpointCap` | 单个检查点的编译预算（默认 65536） |
 | `auto` | 注册步骤间自动压缩 |
-| `thresholdRatio` | 触发自动压缩的上下文窗口占比（默认 `0.5`） |
+| `thresholdRatio` | 触发自动压缩的上下文窗口占比（默认 `0.8`） |
 | `retainTurns` | 优先保留的完整回合数（默认 `1`；不突破上限） |
 | `retainTokens` | 保留区 token **硬上限**，补足回合或截取最近回合时永不超出（默认 `5120`） |
 
