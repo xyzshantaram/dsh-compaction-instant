@@ -565,6 +565,66 @@ function debugLog(config, tag, line) {
 }
 
 /**
+ * Recognise a subagent report that arrives as an ordinary user message.
+ *
+ * The harness delivers a background subagent's result to the orchestrator as a
+ * user-role message. Compiled as plain user text it becomes indistinguishable
+ * from something the human typed and from the orchestrator's own narration --
+ * so a compacted transcript reads as if the agent had itself CONCLUDED
+ * everything a worker merely CLAIMED. Attribution is therefore not cosmetic:
+ * the summary is re-read by the model, and an unverified worker report
+ * promoted to established fact is a failure this engine should not cause.
+ *
+ * @param text - one sanitised user text block.
+ * @returns `{ agentId, kind, body }`, or null when the text is not a report.
+ */
+const SUBAGENT_REPORT_RE =
+  /^Background subagent ([0-9a-fA-F][0-9a-fA-F-]{7,})\s+(reported:|finished and will do no further work[\s\S]*?Its closing message:)\s*/;
+
+export function subagentReportOf(text) {
+  if (typeof text !== "string") return null;
+  const match = SUBAGENT_REPORT_RE.exec(text);
+  if (match === null) return null;
+  const body = text.slice(match[0].length);
+  if (body.length === 0) return null;
+  return {
+    agentId: match[1],
+    kind: match[2].startsWith("reported") ? "reported" : "finished",
+    body,
+  };
+}
+
+/**
+ * Wrap a report body in a fence its own content cannot break.
+ *
+ * A FENCE, not a blockquote or <details>. Reports routinely contain fenced code
+ * and tables, so the delimiter is chosen FROM the content: one backtick longer
+ * than the longest run inside, which is the standard CommonMark escape and
+ * leaves the body byte-exact. A blockquote would have to touch every line;
+ * <details> costs materially more tokens in a document whose whole purpose is
+ * to be small.
+ *
+ * The info string carries the author, so the wrapper is machine-readable and
+ * not merely a visual cue: a later reader can tell WHICH agent said this.
+ *
+ * Truncation happens BEFORE this call, so the closing fence is always emitted
+ * and a clipped report can never bleed into the surrounding document.
+ *
+ * @param report - a `subagentReportOf` result.
+ * @param body - the (possibly truncated) report body.
+ * @returns the fenced block.
+ */
+export function fenceSubagentReport(report, body) {
+  let longest = 0;
+  const runs = body.match(/`+/g);
+  if (runs !== null) {
+    for (const run of runs) if (run.length > longest) longest = run.length;
+  }
+  const fence = "`".repeat(longest + 1 > 3 ? longest + 1 : 3);
+  return fence + "subagent " + report.agentId + " " + report.kind + "\n" + body + "\n" + fence;
+}
+
+/**
  * Compile one ordered region into compact entries.
  * @param nodes - ordered `{ seq, message }` projections of the shadowed
  *   surface nodes; `message` may be null (non-projecting node).
@@ -792,6 +852,18 @@ export function compileNodes(nodes, config, budgets) {
           let text = sanitize(block.text ?? "");
           if (config.stripNoiseXml !== false) text = stripNoiseXml(text, patterns);
           if (text.length === 0) continue;
+          // A subagent report arrives as a user message but is NOT the user
+          // speaking. Give it its own role header and fence the body, so a
+          // compacted transcript never lets a worker's claim pass for the
+          // orchestrator's own conclusion, or for something the human said.
+          const report = subagentReportOf(text);
+          if (report !== null) {
+            surviving += 1;
+            header = roleHeader("subagent", node.seq);
+            const keptReport = truncateTokens(report.body, effective.userTextTokens, seqRef(node.seq));
+            pushEntry(node.seq, header + fenceSubagentReport(report, keptReport.text), "text");
+            continue;
+          }
           surviving += 1;
           header = roleHeader("user", node.seq);
           const kept = truncateTokens(text, effective.userTextTokens, seqRef(node.seq));
