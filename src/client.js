@@ -558,3 +558,7 @@ window.__ModuleLoader__.load({
   id: "@deepseek-ai/dsh-compaction-instant",
   factory: instantCompactionClientFactory
 });
+window.__ModuleLoader__.load({
+  id: "dsh-compaction-instant",
+  factory: instantCompactionClientFactory
+});
